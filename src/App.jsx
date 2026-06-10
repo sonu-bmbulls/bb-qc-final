@@ -1,0 +1,1593 @@
+// ═════════════════════════════════════════════════════════════════════════════
+// BB QC STUDIO — App.jsx
+//
+// Single-file React app. Everything lives here:
+//   1. CONFIG + THEME           — constants, colors
+//   2. HELPERS                  — fmt, validation
+//   3. ANALYSIS PIPELINE        — frame extraction + Claude vision API
+//   4. UI COMPONENTS            — nav, upload, analyzing, results, timeline
+//   5. MAIN APP                 — state machine + rendering
+//
+// The four hard rules baked into this build:
+//   • TIMESTAMPS are integer seconds, captured from video.currentTime AFTER
+//     each seek completes (so they reflect the actual frame on canvas, not
+//     the requested time). First frame is forced to t=0 so the opening
+//     reliably reads as 0:00.
+//   • CLAUDE NEVER GUESSES timestamps. Each frame carries a [FRAME_METADATA]
+//     block with locked index + timestamp; the prompt explicitly forbids
+//     modification and the app's parser uses frameIndex for the canonical
+//     timestamp lookup.
+//   • REFERENCE BRIEF is injected into the system prompt verbatim when the
+//     user fills the textarea on the upload screen.
+//   • CONSISTENCY: temperature=0 in the API call + an EXHAUSTIVE-PASS
+//     PROTOCOL section in the prompt that mandates the same scanning
+//     routine on every run.
+// ═════════════════════════════════════════════════════════════════════════════
+
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. CONFIG + THEME
+// ═════════════════════════════════════════════════════════════════════════════
+
+const API_URL = "/api/anthropic/v1/messages";
+const API_MODEL = "claude-sonnet-4-5";   // current Sonnet generation with vision
+const API_TEMPERATURE = 0;               // 0 = deterministic-ish output; the single biggest
+                                         // lever for run-to-run consistency
+const API_MAX_TOKENS = 8192;
+const FRAMES_TO_EXTRACT = 20;            // 20 evenly-spaced frames per video
+const MAX_FRAME_WIDTH = 1600;            // px; higher = clearer OCR, more tokens/cost
+
+const CHECKS = [
+  { id: "grammar",  label: "Grammar & Spelling",   icon: "✍️", desc: "Captions, titles, on-screen text" },
+  { id: "safezone", label: "Safe Zone Compliance", icon: "📐", desc: "Text & logos within safe zones" },
+  { id: "quality",  label: "Video Quality",        icon: "🎬", desc: "Resolution, motion, sharpness" },
+  { id: "color",    label: "Color & Brand",        icon: "🎨", desc: "Color grading & cast detection" },
+  { id: "audio",    label: "Audio Levels",         icon: "🔊", desc: "Not analyzed in vision mode" },
+  { id: "metadata", label: "Metadata & Tags",      icon: "🏷️", desc: "Not analyzed in vision mode" },
+];
+
+const VALID_CHECK_IDS = new Set(["grammar", "safezone", "quality", "audio", "color", "metadata"]);
+const VALID_SEVERITIES = new Set(["error", "warning", "info"]);
+
+const T = {
+  bg:        "#0a0608",
+  bgPanel:   "rgba(255,255,255,0.025)",
+  border:    "rgba(255,255,255,0.07)",
+  borderHot: "rgba(220,38,38,0.35)",
+  red:       "#dc2626",
+  redBright: "#ef4444",
+  redDeep:   "#991b1b",
+  redLight:  "#fca5a5",
+  redTint:   "rgba(220,38,38,0.08)",
+  // Purple/violet accent — reserved for Creative & Retention findings so they
+  // visually separate from the red QC technical findings without breaking the
+  // dark-mode brand.
+  purple:       "#a855f7",
+  purpleBright: "#c084fc",
+  purpleLight:  "#e9d5ff",
+  purpleTint:   "rgba(168,85,247,0.08)",
+  borderPurple: "rgba(168,85,247,0.35)",
+  textDim:   "rgba(255,255,255,0.4)",
+  textMute:  "rgba(255,255,255,0.6)",
+  gradient:  "linear-gradient(135deg,#dc2626,#7f1d1d)",
+  gradientPurple: "linear-gradient(135deg,#a855f7,#6b21a8)",
+  gradientText: "linear-gradient(90deg,#ef4444,#fca5a5)",
+};
+
+const SEV = {
+  error:   { dot: "#ef4444", badge: "rgba(239,68,68,0.15)",   badgeText: "#fca5a5", border: "rgba(239,68,68,0.3)",  bg: "rgba(239,68,68,0.06)",  label: "ERROR"   },
+  warning: { dot: "#f59e0b", badge: "rgba(245,158,11,0.15)",  badgeText: "#fcd34d", border: "rgba(245,158,11,0.3)", bg: "rgba(245,158,11,0.06)", label: "WARN"    },
+  info:    { dot: "#10b981", badge: "rgba(16,185,129,0.15)",  badgeText: "#6ee7b7", border: "rgba(16,185,129,0.3)", bg: "rgba(16,185,129,0.06)", label: "INFO"    },
+};
+
+// Two top-level categories. qc_technical = objective mistakes (typos, grammar,
+// safe-zone). creative_retention = performance/creative-direction suggestions
+// (pacing, hooks, missing animation, b-roll suggestions). Each finding belongs
+// to exactly one category and is shown in the matching tab on the results page.
+const CATEGORIES = {
+  qc_technical: {
+    label: "QC Baseline",
+    icon: "⚠️",
+    accent: "#ef4444",
+    accentTint: "rgba(239,68,68,0.1)",
+    border: "rgba(239,68,68,0.3)",
+    desc: "Objective errors — typos, grammar, alignment",
+  },
+  creative_retention: {
+    label: "Creative & Retention",
+    icon: "💡",
+    accent: "#c084fc",
+    accentTint: "rgba(168,85,247,0.1)",
+    border: "rgba(168,85,247,0.35)",
+    desc: "Performance ideas — hooks, pacing, animation",
+  },
+};
+const VALID_CATEGORIES = new Set(Object.keys(CATEGORIES));
+
+// One-click brief presets. The user can still freely edit after applying one.
+const PRESETS = [
+  {
+    id: "everything",
+    icon: "✨",
+    label: "Check Everything",
+    text: "Perform an exhaustive, multi-pass QC review. Scan frame-by-frame for any spelling typos (especially in English/Hinglish overlays), awkward grammar, cut-off text, and safe-zone violations.",
+  },
+  {
+    id: "subtitles",
+    icon: "✍️",
+    label: "Subtitles Audit",
+    text: "Strictly focus on burned-in captions. Check for double-letter typos, incorrect sentence structures, missing punctuation, and layout alignment errors.",
+  },
+  {
+    id: "retention",
+    icon: "🎬",
+    label: "Retention Mode",
+    text: "Act as a creative director. Audit the first 3 seconds for a strong hook. Flag any sections longer than 2.5 seconds without a text animation, zoom, or cut to keep retention high.",
+  },
+];
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+function fmtTs(sec) {
+  if (sec == null || !isFinite(sec)) return "—";
+  const total = Math.max(0, Math.floor(sec));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. ANALYSIS PIPELINE
+//
+// This section was previously in src/videoAnalysis.js. Inlined here to keep
+// everything in one file per the workflow request.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Seek a <video> element to a specific time and resolve when 'seeked' fires.
+function seekTo(video, time) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      video.removeEventListener("seeked", onSeeked);
+      reject(new Error("Seek timeout"));
+    }, 5000);
+    const onSeeked = () => {
+      clearTimeout(timeout);
+      video.removeEventListener("seeked", onSeeked);
+      resolve();
+    };
+    video.addEventListener("seeked", onSeeked);
+    video.currentTime = Math.min(Math.max(0, time), Math.max(0, video.duration - 0.05));
+  });
+}
+
+/**
+ * Extract N evenly-spaced frames from a video file as base64 JPEGs.
+ *
+ * RULE 1 of this build: timestamps are INTEGER SECONDS captured from
+ * video.currentTime AFTER each seek completes. We round DOWN (floor)
+ * rather than to-nearest so the first frame (currentTime ≈ 0.0) reliably
+ * lands on second 0, not second 1.
+ *
+ * The first sample point is forced to t = 0 so the very opening frame is
+ * always part of the analysis — title cards live there.
+ */
+async function extractFrames(file, targetFrames, onProgress = () => {}) {
+  const video = document.createElement("video");
+  const url = URL.createObjectURL(file);
+  video.src = url;
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Video metadata timeout — browser may not support this format")),
+      15000
+    );
+    video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+    video.onerror = () => { clearTimeout(timeout); reject(new Error("Browser could not decode this video file")); };
+  });
+
+  const duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 60;
+
+  // Downscale to MAX_FRAME_WIDTH. Higher resolution = better OCR on small/
+  // stylized text but more tokens/cost. 1600px is a strong default.
+  const scale = video.videoWidth > MAX_FRAME_WIDTH ? MAX_FRAME_WIDTH / video.videoWidth : 1;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+  canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+  const ctx = canvas.getContext("2d");
+
+  // Build the request timestamps. First sample is forced to t=0 so the
+  // opening frame is always covered. Last sample lands near (but not at)
+  // the very end. The remaining samples are evenly spaced between them.
+  const lastTs = Math.max(0.1, duration - 0.3);
+  const requestedTimestamps = [];
+  if (targetFrames === 1) {
+    requestedTimestamps.push(0);
+  } else {
+    for (let i = 0; i < targetFrames; i++) {
+      requestedTimestamps.push((lastTs * i) / (targetFrames - 1));
+    }
+  }
+
+  const frames = [];
+  const seenSeconds = new Set();
+  for (let i = 0; i < requestedTimestamps.length; i++) {
+    const target = requestedTimestamps[i];
+    onProgress({ phase: "extracting", current: i + 1, total: requestedTimestamps.length });
+    try {
+      await seekTo(video, target);
+      // small delay to ensure the decoded frame is actually painted
+      await new Promise(r => setTimeout(r, 100));
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // ── Lock the timestamp ───────────────────────────────────────────────
+      // Read the actual position the canvas drew from (codecs only seek to
+      // keyframes, so video.currentTime can differ from our request).
+      // Floor to integer second per the spec: the timestamp attached to the
+      // image payload is exactly the second the user will scrub to.
+      const tsSeconds = Math.max(0, Math.floor(video.currentTime));
+
+      // Skip duplicates — multiple requested timestamps can collide on the
+      // same integer second on short videos. No point sending Claude the
+      // same image twice with the same label.
+      if (seenSeconds.has(tsSeconds)) continue;
+      seenSeconds.add(tsSeconds);
+
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
+      frames.push({ ts: tsSeconds, data: dataUrl.split(",")[1] });
+    } catch (e) {
+      console.warn(`Frame at ${target.toFixed(1)}s failed:`, e.message);
+    }
+  }
+
+  URL.revokeObjectURL(url);
+  video.remove();
+
+  if (frames.length === 0) throw new Error("Could not extract any frames from video");
+  // Sort by timestamp (skipped-dup logic may have produced out-of-order frames)
+  frames.sort((a, b) => a.ts - b.ts);
+  return { frames, duration };
+}
+
+/**
+ * Send extracted frames to Claude with the strict QC prompt.
+ *
+ * Rules 2, 3, 4 of this build are enforced here:
+ *   • Each frame is prefixed with a [FRAME_METADATA] text block holding the
+ *     locked index + timestamp. The prompt forbids any modification.
+ *   • Reference brief is injected verbatim into a dedicated prompt section
+ *     when non-empty.
+ *   • temperature=0 + an EXHAUSTIVE-PASS PROTOCOL section in the prompt
+ *     mandate the same scanning routine every run.
+ */
+async function analyzeFrames(frames, duration, signal, referenceBrief = "") {
+  if (!frames || frames.length === 0) throw new Error("No frames to analyze");
+
+  const briefClean = (referenceBrief || "").trim();
+  const hasBrief = briefClean.length > 0;
+
+  // Build the content array. Order matters: system instructions first, then
+  // each frame as [FRAME_METADATA] + image, then the final JSON instruction.
+  const content = [];
+
+  content.push({
+    type: "text",
+    text: `You are an eagle-eyed Post-Production QC Specialist for SOCIAL MEDIA video content — reels, shorts, brand promos, real-estate spots, paid-social ads. Your reviewers are CD-level finicky. Editors send you their export expecting you to catch every text mistake they missed at 2am during their final render.
+
+You will receive a sequence of ${frames.length} frames from a single video (total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
+
+═══════════════════════════════════════════════════════════════════════════
+TIMESTAMP RULE — NON-NEGOTIABLE
+═══════════════════════════════════════════════════════════════════════════
+Each frame has a hardcoded, designated timestamp metadata property in its
+[FRAME_METADATA] block. You are STRICTLY FORBIDDEN from estimating,
+modifying, calculating, or guessing any timestamp.
+
+Your JSON response MUST use the exact, identical timestamp provided in the
+[FRAME_METADATA] block of the frame where the issue is visually captured.
+Copy it verbatim from the metadata. If [FRAME_METADATA] says "timestamp=12",
+your JSON's "timestamp" field for any finding in that frame is exactly 12.
+Not 11. Not 13. Not 12.5. The integer "12".
+
+Also include the frameIndex from the metadata block, verbatim, for every
+finding. The pair (frameIndex, timestamp) must match an actual metadata
+block you were given — do not invent combinations.
+
+═══════════════════════════════════════════════════════════════════════════
+LANGUAGES YOU MUST SCAN — ESPECIALLY HINGLISH
+═══════════════════════════════════════════════════════════════════════════
+A lot of the content is HINGLISH (Hindi in English script — "Jab palm
+Jebel Ali complete hoga", "Studio start karenge", "Maan lo koi", "Entry
+kaise milegi"). Scan Hinglish text with EXACTLY the same rigor as English.
+
+Critical: an English-spelled word inside a Hinglish sentence MUST still
+be spelled correctly in English. If the line is "Jab palm Jebel Ali
+compaaaete hoga", "compaaaete" is an English misspelling of "complete"
+and you flag it — the surrounding Hinglish does NOT excuse it.
+
+═══════════════════════════════════════════════════════════════════════════
+REPEATED-LETTER TYPOS — ZERO-TOLERANCE
+═══════════════════════════════════════════════════════════════════════════
+ANY word with 3+ consecutive identical letters is a typo. Period. No
+exceptions for style, no exceptions for language. Flag every single one.
+
+  • "Stuudio"       → "Studio"
+  • "Exxxxpo"       → "Expo"
+  • "laaaaunch"     → "launch"
+  • "compaaaete"    → "complete"
+  • "Receeive"      → "Receive"
+  • "Buuuilding"    → "Building"
+
+Minimum severity for repeated-letter typos: "warning". Use "error" when
+the intended word is unambiguous.
+
+═══════════════════════════════════════════════════════════════════════════
+OTHER DEFECTS TO CATCH
+═══════════════════════════════════════════════════════════════════════════
+1. Spelling — missing/extra/transposed letters, homophones, wrong-word
+   substitutions ("there"/"their").
+2. Grammar & sentence formation — broken construction, missing articles,
+   subject-verb disagreement, tense shifts, run-on captions.
+3. Punctuation — missing terminal punctuation, missing commas, stray
+   or doubled punctuation.
+4. Capitalization — inconsistent across frames, random mid-word capitals,
+   ALL CAPS where Title Case was intended.
+5. Line breaks — text broken at awkward points (article split from its
+   noun), widow/orphan single words.
+6. Layout — text touching/crossing the title-safe boundary (outer 5%),
+   text overlapping other graphics, illegible from low contrast.
+7. Consistency — same word or brand spelled/styled differently across
+   frames within this video.
+
+═══════════════════════════════════════════════════════════════════════════
+DO NOT FLAG
+═══════════════════════════════════════════════════════════════════════════
+• Verified brand names and place names ("Jebel Ali", "Dubai", "Expo City",
+  "Raw District"). When in doubt about a proper noun, do not flag.
+• Hinglish words spelled correctly for Hinglish ("hoga", "kaise", "mein",
+  "karenge", "Maan lo") — these are the register, not typos.
+• Clearly intentional stylistic choices (artistic kerning, decorative
+  all-caps for emphasis on a single word).
+
+═══════════════════════════════════════════════════════════════════════════
+TWO CATEGORIES OF FINDING — KEEP THEM SEPARATE
+═══════════════════════════════════════════════════════════════════════════
+Every finding you emit belongs to EXACTLY ONE of two categories. Set the
+"category" field on each finding accordingly. Do not put a finding in both.
+
+CATEGORY 1 — "qc_technical"
+  Objective, defensible mistakes that an editor must fix before delivery.
+  Anything from the rules above lives here:
+    • Spelling errors and repeated-letter typos
+    • Grammar / sentence construction / punctuation
+    • Capitalization
+    • Line breaks and layout
+    • Safe-zone violations
+    • Visual / compression artifacts
+    • Consistency mismatches across frames
+  These are not opinions. They are wrong and need correcting.
+
+CATEGORY 2 — "creative_retention"
+  Performance-oriented creative-direction suggestions for social
+  optimization. These are NOT errors — they are growth ideas. Examples:
+    • "Hook is missing on-screen text in the first 2.5s — viewers scroll
+       past silent openings"
+    • "No visual change (cut, zoom, or text pop) between 0:08 and 0:13 —
+       5s of static frame will drop retention in this format"
+    • "Title card at 0:15 reads for 1.2s — too quick for the word count;
+       extend to ~2s or shorten copy"
+    • "End card holds 3s on the price without an arrow/CTA — add a
+       directional element to drive tap-throughs"
+    • "Pacing is consistently slow versus top-performing reels in this
+       category — consider tighter cuts in the middle third"
+    • "Opening frame is the talent's face with no text overlay — viewers
+       in feed need to know the hook within 1s"
+
+  Use severity "info" for creative suggestions by default, "warning"
+  only when an opening-hook problem is severe enough to materially
+  hurt retention (e.g. no hook text in the first 3 seconds).
+  Use checkId "quality" for retention/pacing findings.
+
+CRITICAL: Do NOT promote a creative_retention idea to a qc_technical
+finding. "Add a zoom here" is never an error. Conversely, do NOT
+demote a real typo to creative_retention. "Spelling: 'compaaaete'"
+is never just a suggestion.
+
+${hasBrief ? `═══════════════════════════════════════════════════════════════════════════
+USER-PROVIDED AUDIT INSTRUCTIONS — CROSS-REFERENCE STRICTLY
+═══════════════════════════════════════════════════════════════════════════
+The user has provided these specific audit instructions/notes. You must
+cross-reference the visual text elements against these instructions in
+addition to every standard QC rule above.
+
+If the user indicates a specific number of errors to look for, or mentions
+that errors definitely exist, perform an EXHAUSTING, HIGHLY RIGOROUS pass
+to identify every single text anomaly — re-read every frame, do not stop
+after the first few findings, keep scanning until every defect across all
+${frames.length} frames is catalogued.
+
+Decide the right CATEGORY based on what the brief asks for:
+  • If the brief is about creative direction / retention / hooks / pacing
+    (e.g. "Retention Mode" preset), the resulting findings should go into
+    creative_retention.
+  • If the brief is about typos / grammar / specific words to verify
+    (e.g. "Subtitles Audit" preset), the resulting findings should go
+    into qc_technical.
+  • If the brief covers both, split findings between the two categories
+    based on which kind of finding each one is.
+
+Any deviation from the user's instructions is a finding:
+  • Wrong prices, wrong product/brand names, wrong dates → "error", qc_technical
+  • Tone/phrasing deviations from the brief → "warning", qc_technical
+  • In the "fix" field, explicitly reference the user's instruction
+
+THE USER'S INSTRUCTIONS (treat as authoritative for this video):
+<user_instructions>
+${briefClean}
+</user_instructions>
+
+` : ""}═══════════════════════════════════════════════════════════════════════════
+EXHAUSTIVE-PASS PROTOCOL — RUN THIS EVERY TIME
+═══════════════════════════════════════════════════════════════════════════
+For consistent results across runs, execute this exact protocol for
+every analysis. Do not shortcut it.
+
+  PASS 1 — Inventory:  For each frame, list every piece of visible
+                       burned-in text (titles, captions, lower-thirds,
+                       end-cards, sticker text, animated type).
+  PASS 2 — Rules:      For each piece of text inventoried, apply every
+                       rule above (typos, grammar, punctuation, caps,
+                       line breaks, layout, consistency). Tag each
+                       finding as qc_technical.
+  PASS 3 — Brief:      ${hasBrief ? "Cross-reference every frame against the user's instructions above. Flag every deviation. Tag with appropriate category per the brief." : "(No user instructions provided — skip this pass.)"}
+  PASS 4 — Sweep:      Re-scan every frame one more time looking
+                       specifically for repeated-letter typos. These
+                       are the most-missed defect. Tag as qc_technical.
+  PASS 5 — Creative:   Now switch hats. Walk through the frames in
+                       sequence as a creative director. Identify
+                       retention/pacing/hook issues. Tag these as
+                       creative_retention. Be generous — most videos
+                       have 2-5 legitimate creative suggestions.
+  PASS 6 — Compile:    Emit one finding object per defect/suggestion.
+                       Do not collapse multiple findings into one.
+                       Do not omit findings to keep the list short.
+
+═══════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT — STRICT JSON, NO PROSE
+═══════════════════════════════════════════════════════════════════════════
+Return ONLY a JSON array. No markdown fences. No preamble. No commentary
+before or after. Just the array.
+
+Each finding is an object with EXACTLY these fields, in this order:
+
+{
+  "frameIndex": <integer copied verbatim from the [FRAME_METADATA] block>,
+  "timestamp":  <integer seconds copied verbatim from the [FRAME_METADATA] block>,
+  "category":   "qc_technical" | "creative_retention",
+  "checkId":    "grammar" | "safezone" | "quality" | "color",
+  "severity":   "error" | "warning" | "info",
+  "msg":        "<specific finding — quote the exact wrong text>",
+  "fix":        "<professional suggestion: exact replacement text plus phrasing/styling improvement>"
+}
+
+Severity assignment (apply consistently):
+  • Repeated-letter typo  → "warning" minimum, "error" preferred
+  • Other spelling error  → "warning" minimum
+  • Brief deviation (factual mismatch like wrong price/name) → "error"
+  • Safe-zone violation   → "error"
+  • Grammar / punctuation → "warning"
+  • Capitalization        → "warning"
+  • Style / consistency   → "info" (only when truly stylistic, never wrong)
+  • Creative suggestion   → "info" default, "warning" for hook problems
+
+Msg field — quote the exact wrong text from the frame. For spellings,
+format as:  Spelling: "WRONGWORD" → "CORRECTWORD"
+For creative findings, lead with the issue, e.g.:
+  "Hook gap: no on-screen text in frames at 0:00–0:03"
+
+Fix field — professional, actionable: (a) exact replacement or concrete
+suggestion, (b) phrasing/styling improvement or rationale.
+
+If there are zero findings, return [].
+The array order does not matter — the app sorts by timestamp.
+
+Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
+`,
+  });
+
+  // Append each frame as: [FRAME_METADATA] block, then the image itself.
+  frames.forEach((f, i) => {
+    content.push({
+      type: "text",
+      text: `[FRAME_METADATA] frameIndex=${i} timestamp=${f.ts} (LOCKED — DO NOT MODIFY)`,
+    });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: f.data },
+    });
+  });
+
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      model: API_MODEL,
+      max_tokens: API_MAX_TOKENS,
+      temperature: API_TEMPERATURE,   // 0 = deterministic; biggest lever for consistency
+      messages: [{ role: "user", content }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    let detail = "";
+    try {
+      const j = JSON.parse(errText);
+      detail = j.error?.message || errText;
+    } catch { detail = errText; }
+    throw new Error(`API ${res.status}: ${detail || res.statusText}`);
+  }
+
+  const data = await res.json();
+  if (data?.stop_reason === "max_tokens") {
+    throw new Error(
+      "Claude's response hit the output token limit before finishing. " +
+      "Try reducing FRAMES_TO_EXTRACT (e.g. 20 → 14) or raise API_MAX_TOKENS."
+    );
+  }
+
+  const text = data?.content?.map(b => b.text || "").join("").trim() || "";
+
+  // Browser-console diagnostic. Open DevTools → Console after analysis to see
+  // exactly what Claude returned. Useful when issue counts seem off.
+  console.groupCollapsed(
+    `%c[BB QC] Claude raw response (${text.length} chars, stop_reason=${data?.stop_reason})`,
+    "color:#fca5a5;font-weight:600"
+  );
+  console.log(text);
+  console.log("Usage:", data?.usage);
+  console.groupEnd();
+
+  const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  let parsed;
+  try { parsed = JSON.parse(stripped); }
+  catch {
+    const fullMatch = stripped.match(/\[[\s\S]*\]/);
+    if (fullMatch) { try { parsed = JSON.parse(fullMatch[0]); } catch { /* fall through */ } }
+    if (!parsed) {
+      const start = stripped.indexOf("[");
+      if (start >= 0) {
+        const slice = stripped.slice(start);
+        const lastComplete = slice.lastIndexOf("},");
+        if (lastComplete > 0) {
+          const repaired = slice.slice(0, lastComplete + 1) + "]";
+          try { parsed = JSON.parse(repaired); } catch { /* fall through */ }
+        }
+      }
+    }
+    if (!parsed) {
+      throw new Error(
+        "Could not parse JSON from Claude's response. " +
+        `First 200 chars: ${stripped.slice(0, 200)}`
+      );
+    }
+  }
+
+  if (!Array.isArray(parsed)) throw new Error("API response was not a JSON array");
+
+  // Validate, sanitize, and lock timestamps from our metadata (not from Claude).
+  // Claude is told to copy them verbatim, but we always use OUR frame.ts as the
+  // canonical truth — defense in depth against any drift.
+  const issues = [];
+  let nextId = 1;
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    if (!VALID_CHECK_IDS.has(item.checkId)) continue;
+    if (!VALID_SEVERITIES.has(item.severity)) continue;
+    if (typeof item.msg !== "string" || !item.msg.trim()) continue;
+
+    const frameIdx = Number(item.frameIndex);
+    let ts = null;
+    if (Number.isFinite(frameIdx) && frameIdx >= 0 && frameIdx < frames.length) {
+      ts = frames[frameIdx].ts;   // ← canonical timestamp from our metadata
+    } else if (Number.isFinite(Number(item.timestamp))) {
+      // Fallback: if Claude returned a timestamp but a bad frameIndex, try the
+      // timestamp value (still validated against the set of known frame ts).
+      const claimedTs = Math.round(Number(item.timestamp));
+      const match = frames.find(f => f.ts === claimedTs);
+      if (match) ts = match.ts;
+    }
+
+    issues.push({
+      id: nextId++,
+      // Default to qc_technical if Claude forgot the field — safer fallback
+      // since the bulk of findings should be technical. Invalid values also
+      // fall through to this default rather than dropping the finding.
+      category: VALID_CATEGORIES.has(item.category) ? item.category : "qc_technical",
+      checkId: item.checkId,
+      severity: item.severity,
+      ts,
+      msg: String(item.msg).slice(0, 400),
+      fix: typeof item.fix === "string" && item.fix.trim() ? String(item.fix).slice(0, 800) : null,
+    });
+  }
+
+  return { issues, debugText: text };
+}
+
+// Quick API connectivity probe used by the upload screen to show a status dot.
+async function probeApi() {
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: API_MODEL,
+        max_tokens: 10,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+      }),
+    });
+    if (res.ok) return { ok: true };
+    const errText = await res.text().catch(() => "");
+    let detail = errText;
+    try { detail = JSON.parse(errText)?.error?.message || errText; } catch {}
+    return { ok: false, status: res.status, detail };
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. UI COMPONENTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+function ScoreRing({ score, size = 64 }) {
+  const r = size * 0.4, circ = 2 * Math.PI * r;
+  const color = score >= 80 ? "#10b981" : score >= 60 ? "#f59e0b" : T.redBright;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={size*0.08}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={size*0.08}
+        strokeDasharray={`${(score/100)*circ} ${circ}`} strokeLinecap="round"
+        style={{transform:"rotate(-90deg)",transformOrigin:"50% 50%",transition:"stroke-dasharray 1s ease"}}/>
+      <text x="50%" y="54%" textAnchor="middle" fill={color} fontSize={size*0.22} fontWeight="700" fontFamily="DM Mono, monospace">{score}</text>
+    </svg>
+  );
+}
+
+function Timeline({ issues, currentTs, duration, onSeek }) {
+  const D = duration || 60;
+  const timedIssues = issues.filter(i => i.ts != null && i.ts <= D);
+  const step = D > 30 ? 10 : Math.max(1, Math.round(D / 9));
+  const ticks = [];
+  for (let t = 0; t <= D; t += step) ticks.push(t);
+
+  return (
+    <div style={{ userSelect: "none" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: T.textDim, fontFamily: "DM Mono, monospace" }}>0:00</span>
+        <span style={{ fontSize: 11, color: T.textDim, fontFamily: "DM Mono, monospace" }}>{fmtTs(Math.round(D))}</span>
+      </div>
+      <div
+        onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const ratio = (e.clientX - rect.left) / rect.width;
+          onSeek(Math.round(ratio * D));
+        }}
+        style={{ position: "relative", height: 44, background: "rgba(255,255,255,0.03)", borderRadius: 10, cursor: "crosshair", border: `1px solid ${T.border}` }}
+      >
+        {ticks.map(t => (
+          <div key={t} style={{ position: "absolute", left: `${(t/D)*100}%`, top: 0, bottom: 0, width: 1, background: "rgba(255,255,255,0.05)" }}>
+            <span style={{ position: "absolute", bottom: -16, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(255,255,255,0.2)", fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtTs(t)}</span>
+          </div>
+        ))}
+        {timedIssues.map(issue => {
+          const left = `${(issue.ts / D) * 100}%`;
+          const s = SEV[issue.severity];
+          const isActive = currentTs != null && Math.abs(currentTs - issue.ts) < 0.5;
+          const isCreative = issue.category === "creative_retention";
+          // Technical findings = solid colored dot (red/amber/green by severity).
+          // Creative findings  = hollow purple ring, so you can spot the two
+          // populations on the timeline without clicking through.
+          return (
+            <div
+              key={issue.id}
+              onClick={(e) => { e.stopPropagation(); onSeek(issue.ts); }}
+              title={`${fmtTs(issue.ts)} · ${isCreative ? "💡 " : ""}${issue.msg}`}
+              style={{
+                position: "absolute", left, top: "50%", transform: "translate(-50%,-50%)",
+                width: isActive ? 16 : 11, height: isActive ? 16 : 11,
+                borderRadius: "50%",
+                background: isCreative ? "transparent" : s.dot,
+                cursor: "pointer",
+                border: isCreative
+                  ? `2px solid ${T.purpleBright}`
+                  : (isActive ? `2px solid white` : `2px solid rgba(0,0,0,0.5)`),
+                boxShadow: isActive
+                  ? `0 0 0 4px ${(isCreative ? T.purpleBright : s.dot)}55`
+                  : "none",
+                transition: "all 0.15s ease", zIndex: isActive ? 10 : 5,
+              }}
+            />
+          );
+        })}
+        {currentTs != null && (
+          <div style={{
+            position: "absolute", left: `${(currentTs / D) * 100}%`, top: -4, bottom: -4,
+            width: 2, background: "white", borderRadius: 2, pointerEvents: "none", zIndex: 20,
+            boxShadow: "0 0 8px rgba(255,255,255,0.6)",
+          }}>
+            <div style={{ position: "absolute", top: -5, left: "50%", transform: "translateX(-50%)", width: 10, height: 10, borderRadius: "50%", background: "white" }} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function IssueCard({ issue, isSelected, onClick }) {
+  const s = SEV[issue.severity];
+  const check = CHECKS.find(c => c.id === issue.checkId);
+  const isCreative = issue.category === "creative_retention";
+  // Creative cards get a purple left-stripe + subtle purple glow on hover/select
+  // so they're visually distinct even if you somehow see them mixed in.
+  const stripeColor = isCreative ? T.purpleBright : s.dot;
+  const selectedBorder = isCreative ? T.purpleBright + "60" : s.dot + "60";
+  const selectedBg = isCreative ? T.purpleTint : s.bg;
+  return (
+    <div
+      onClick={() => onClick(issue)}
+      style={{
+        position: "relative",
+        padding: "12px 14px 12px 18px",
+        borderRadius: 10,
+        background: isSelected ? selectedBg : "rgba(255,255,255,0.02)",
+        border: `1px solid ${isSelected ? selectedBorder : T.border}`,
+        cursor: "pointer",
+        transition: "all 0.15s",
+        boxShadow: isSelected && isCreative ? "0 0 24px rgba(168,85,247,0.15)" : "none",
+      }}
+    >
+      <div style={{ position: "absolute", left: 0, top: 12, bottom: 12, width: 3, background: stripeColor, borderRadius: 2 }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+        {issue.ts != null && (
+          <span style={{
+            fontSize: 11,
+            fontFamily: "DM Mono, monospace",
+            color: isCreative ? T.purpleLight : T.redLight,
+            fontWeight: 600,
+          }}>
+            ▶ {fmtTs(issue.ts)}
+          </span>
+        )}
+        {isCreative ? (
+          <span style={{
+            fontSize: 9,
+            padding: "2px 7px",
+            borderRadius: 4,
+            background: T.purpleTint,
+            color: T.purpleLight,
+            fontWeight: 800,
+            letterSpacing: "0.06em",
+            border: `1px solid ${T.borderPurple}`,
+          }}>
+            💡 IDEA
+          </span>
+        ) : (
+          <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: s.badge, color: s.badgeText, fontWeight: 800, letterSpacing: "0.06em" }}>
+            {s.label}
+          </span>
+        )}
+        <span style={{ fontSize: 11, color: T.textDim, marginLeft: "auto" }}>
+          {check?.icon} {check?.label}
+        </span>
+      </div>
+      <p style={{ fontSize: 13, color: "white", lineHeight: 1.45, fontWeight: 500 }}>{issue.msg}</p>
+      {issue.fix && (
+        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>{issue.fix}</p>
+      )}
+    </div>
+  );
+}
+
+function Nav({ apiStatus }) {
+  const dotColor = !apiStatus.probed ? "#94a3b8" : apiStatus.ok ? "#10b981" : T.redBright;
+  const dotLabel = !apiStatus.probed ? "Checking API…" : apiStatus.ok ? "API connected" : "API unavailable";
+  return (
+    <nav style={{ borderBottom: `1px solid ${T.border}`, background: "rgba(10,6,8,0.97)", backdropFilter: "blur(20px)", position: "sticky", top: 0, zIndex: 50 }}>
+      <div style={{ maxWidth: 1480, margin: "0 auto", padding: "0 24px", height: 60, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 9, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, letterSpacing: "-0.02em", boxShadow: "0 4px 12px rgba(220,38,38,0.3)" }}>BB</div>
+          <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
+            <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.01em" }}>BB QC Studio</span>
+            <span style={{ fontSize: 10, color: T.textDim, letterSpacing: "0.04em" }}>Video Quality Control</span>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 12px", borderRadius: 20, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}` }} title={apiStatus.detail || ""}>
+          <div style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, boxShadow: `0 0 8px ${dotColor}` }} />
+          <span style={{ fontSize: 12, color: T.textMute }}>{dotLabel}</span>
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+function MagicPresetChips({ activeId, onPick }) {
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+      {PRESETS.map((p) => {
+        const isActive = activeId === p.id;
+        return (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => onPick(p)}
+            title={p.text}
+            style={{
+              padding: "7px 14px",
+              borderRadius: 22,
+              background: isActive ? T.gradientPurple : "rgba(255,255,255,0.025)",
+              border: `1px solid ${isActive ? T.borderPurple : T.border}`,
+              color: isActive ? "white" : T.textMute,
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
+              transition: "all 0.15s",
+              boxShadow: isActive ? "0 4px 14px rgba(168,85,247,0.3)" : "none",
+              whiteSpace: "nowrap",
+            }}
+            onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.borderColor = T.borderPurple; }}
+            onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.borderColor = T.border; }}
+          >
+            <span style={{ fontSize: 13 }}>{p.icon}</span>
+            <span>{p.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, apiStatus, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId }) {
+  const briefChars = referenceBrief.length;
+  const briefLimit = 4000;
+  return (
+    <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)", paddingTop: 40, paddingBottom: 40 }}>
+      <div style={{ textAlign: "center", marginBottom: 36 }}>
+        <h1 style={{ fontSize: 44, fontWeight: 800, letterSpacing: "-0.02em", lineHeight: 1.05 }}>
+          Catch every QC mistake.<br />
+          <span style={{ background: T.gradientText, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            Before delivery.
+          </span>
+        </h1>
+        <p style={{ color: T.textDim, marginTop: 14, fontSize: 15, maxWidth: 540 }}>
+          Drop a video. Claude reads every on-screen frame, spell-checks captions and titles, and flags safe-zone violations — with timestamps.
+        </p>
+      </div>
+
+      <div
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => fileRef.current?.click()}
+        style={{
+          width: "100%", maxWidth: 540,
+          border: `2px dashed ${dragOver ? T.red : "rgba(255,255,255,0.12)"}`,
+          borderRadius: 20, padding: "60px 40px", textAlign: "center", cursor: "pointer",
+          background: dragOver ? T.redTint : "rgba(255,255,255,0.02)",
+          transition: "all 0.2s",
+        }}
+      >
+        <div style={{ fontSize: 46, marginBottom: 16 }}>🎥</div>
+        <p style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Drop your video here</p>
+        <p style={{ color: T.textDim, fontSize: 13, marginBottom: 24 }}>MP4, MOV, WebM, AVI — up to ~500 MB recommended</p>
+        <span style={{ background: T.gradient, padding: "11px 32px", borderRadius: 10, fontSize: 13, fontWeight: 700, display: "inline-block", boxShadow: "0 4px 14px rgba(220,38,38,0.35)" }}>
+          Select Video File
+        </span>
+        <input ref={fileRef} type="file" accept="video/*" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+      </div>
+
+      {/* ── Reference Brief / Script / Editor Notes ─────────────────────── */}
+      <div style={{ width: "100%", maxWidth: 540, marginTop: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <label htmlFor="ref-brief" style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            Reference Brief / Script / Editor Notes
+            <span style={{ color: T.textDim, fontWeight: 500, letterSpacing: "0.02em", textTransform: "none", marginLeft: 6 }}>· optional</span>
+          </label>
+          <span style={{
+            fontSize: 10,
+            color: briefChars > briefLimit ? T.redBright : T.textDim,
+            fontFamily: "DM Mono, monospace",
+          }}>
+            {briefChars}/{briefLimit}
+          </span>
+        </div>
+
+        {/* One-click magic-prompt preset chips. Click → fills the textarea.
+            User can still freely edit; if they edit away from the preset
+            text, the highlight clears so they know they're now on custom. */}
+        <MagicPresetChips
+          activeId={activePresetId}
+          onPick={(p) => {
+            setReferenceBrief(p.text);
+            setActivePresetId(p.id);
+          }}
+        />
+
+        <textarea
+          id="ref-brief"
+          value={referenceBrief}
+          onChange={(e) => {
+            setReferenceBrief(e.target.value);
+            // If the user edits away from the matching preset text, clear
+            // the active-preset highlight so the chip no longer shows as
+            // selected. If they happen to type a string that matches a
+            // preset, light it back up.
+            const match = PRESETS.find(p => p.text === e.target.value);
+            setActivePresetId(match ? match.id : null);
+          }}
+          rows={5}
+          placeholder={`Paste your script, brand guidelines, or specific checks here. Or tap a preset above.`}
+          style={{
+            width: "100%",
+            padding: "12px 14px",
+            borderRadius: 10,
+            background: "rgba(255,255,255,0.025)",
+            border: `1px solid ${referenceBrief ? T.borderHot : T.border}`,
+            color: "white",
+            fontSize: 12,
+            fontFamily: "DM Sans, sans-serif",
+            lineHeight: 1.55,
+            resize: "vertical",
+            minHeight: 110,
+            outline: "none",
+            transition: "border-color 0.2s",
+            boxSizing: "border-box",
+          }}
+          onFocus={(e) => { e.target.style.borderColor = T.red; }}
+          onBlur={(e) => { e.target.style.borderColor = referenceBrief ? T.borderHot : T.border; }}
+        />
+        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
+          {referenceBrief
+            ? <>✓ Claude will cross-reference the video against these instructions and perform an exhaustive pass.</>
+            : <>If provided, Claude will strictly audit the video against these requirements — wrong prices, missing brand terms, off-script copy, etc.</>
+          }
+        </p>
+      </div>
+
+      <div style={{ display: "flex", gap: 20, marginTop: 32, flexWrap: "wrap", justifyContent: "center", maxWidth: 700 }}>
+        {CHECKS.filter(c => c.id !== "audio" && c.id !== "metadata").map(c => (
+          <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, color: T.textDim, fontSize: 13 }}>
+            <span>{c.icon}</span><span>{c.label}</span>
+          </div>
+        ))}
+      </div>
+
+      {apiStatus.probed && !apiStatus.ok && (
+        <div style={{ marginTop: 32, maxWidth: 540, padding: "12px 16px", borderRadius: 10, background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.3)", display: "flex", gap: 12, alignItems: "flex-start" }}>
+          <span style={{ fontSize: 16 }}>⚠️</span>
+          <div style={{ flex: 1 }}>
+            <p style={{ fontSize: 13, fontWeight: 700, color: T.redLight, marginBottom: 4 }}>API not reachable</p>
+            <p style={{ fontSize: 12, color: T.textMute, lineHeight: 1.5 }}>
+              {apiStatus.detail || "The Anthropic API isn't responding."} Make sure <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 3 }}>ANTHROPIC_API_KEY</code> is set in <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 3 }}>.env</code> and restart the dev server (<code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 3 }}>Ctrl+C</code> → <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 3 }}>npm run dev</code>).
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PhaseRow({ done, active, label }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderRadius: 10, background: active ? T.redTint : "rgba(255,255,255,0.02)", border: `1px solid ${active ? T.borderHot : T.border}` }}>
+      {done && <span style={{ color: "#10b981", fontSize: 14 }}>✓</span>}
+      {active && <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${T.red}`, borderTopColor: "transparent", animation: "spin 1s linear infinite" }} />}
+      {!done && !active && <div style={{ width: 8, height: 8, borderRadius: "50%", background: "rgba(255,255,255,0.15)" }} />}
+      <span style={{ fontSize: 13, color: active ? "white" : T.textMute }}>{label}</span>
+    </div>
+  );
+}
+
+function AnalyzingStage({ file, phase, progress, error, onCancel }) {
+  const phaseLabels = {
+    extracting: { title: "Extracting frames", subtitle: "Reading the video at locked integer-second timestamps" },
+    analyzing:  { title: "Analyzing with Claude vision", subtitle: "Reading every on-screen word and checking for issues" },
+    finalizing: { title: "Compiling report",  subtitle: "Sorting findings by timestamp" },
+  };
+  const current = phaseLabels[phase] || phaseLabels.extracting;
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+  return (
+    <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)" }}>
+      <div style={{ width: "100%", maxWidth: 540 }}>
+        {error ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
+            <h2 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Analysis failed</h2>
+            <p style={{ color: T.textDim, fontSize: 13, marginBottom: 24 }}>{file?.name}</p>
+            <div style={{ padding: "14px 18px", borderRadius: 10, background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.3)", marginBottom: 24, textAlign: "left" }}>
+              <p style={{ fontSize: 12, color: T.redLight, fontWeight: 700, marginBottom: 6, letterSpacing: "0.04em" }}>ERROR</p>
+              <p style={{ fontSize: 13, color: "white", lineHeight: 1.5, fontFamily: "DM Mono, monospace" }}>{error}</p>
+              <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.6, marginTop: 12 }}>
+                Check the terminal where you ran <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 4px", borderRadius: 3 }}>npm run dev</code> for proxy errors. Most common causes: missing <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 4px", borderRadius: 3 }}>ANTHROPIC_API_KEY</code> (restart the dev server after setting it), unsupported video codec, no API credit.
+              </p>
+            </div>
+            <button onClick={onCancel} style={{ padding: "10px 28px", borderRadius: 10, background: T.gradient, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+              ↩ Try another file
+            </button>
+          </div>
+        ) : (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 48, marginBottom: 20, animation: "pulse 2s ease-in-out infinite" }}>🔍</div>
+            <h2 style={{ fontSize: 26, fontWeight: 700, marginBottom: 6 }}>{current.title}</h2>
+            <p style={{ color: T.textDim, fontSize: 13, marginBottom: 8 }}>{current.subtitle}</p>
+            <p style={{ color: T.textMute, fontSize: 12, marginBottom: 32, fontFamily: "DM Mono, monospace" }}>{file?.name}</p>
+
+            <div style={{ height: 6, background: "rgba(255,255,255,0.06)", borderRadius: 6, marginBottom: 12, overflow: "hidden" }}>
+              <div style={{
+                height: "100%",
+                width: `${pct}%`,
+                background: T.gradient,
+                borderRadius: 6,
+                transition: "width 0.4s ease",
+                boxShadow: "0 0 12px rgba(220,38,38,0.5)",
+              }} />
+            </div>
+            <p style={{ fontSize: 12, color: T.textDim, fontFamily: "DM Mono, monospace", marginBottom: 32 }}>
+              {progress.current} / {progress.total}
+              {phase === "extracting" && " frames captured"}
+              {phase === "analyzing" && " (Claude is reading the frames…)"}
+            </p>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, textAlign: "left" }}>
+              <PhaseRow done={phase !== "extracting" || progress.current === progress.total} active={phase === "extracting"} label="Extract frames from video" />
+              <PhaseRow done={phase === "finalizing"} active={phase === "analyzing"} label="Send frames to Claude vision API" />
+              <PhaseRow done={false} active={phase === "finalizing"} label="Compile QC report" />
+            </div>
+
+            <button onClick={onCancel} style={{ marginTop: 32, padding: "8px 20px", borderRadius: 8, background: "rgba(255,255,255,0.04)", color: T.textMute, fontSize: 12, fontWeight: 500, cursor: "pointer", border: `1px solid ${T.border}` }}>
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ ring, score, value, label, color }) {
+  return (
+    <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, padding: "14px 18px", display: "flex", flexDirection: "column", alignItems: ring ? "center" : "flex-start", gap: 6 }}>
+      {ring ? (
+        <>
+          <ScoreRing score={score} size={58} />
+          <p style={{ fontSize: 11, color: T.textDim }}>{label}</p>
+        </>
+      ) : (
+        <>
+          <p style={{ fontSize: 11, color: T.textDim, fontWeight: 500 }}>{label}</p>
+          <p style={{ fontSize: 28, fontWeight: 800, color, fontFamily: "DM Mono, monospace", lineHeight: 1 }}>{value}</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function FilterChip({ label, count, active, onClick, color }) {
+  const c = color || T.redLight;
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: "4px 10px",
+        borderRadius: 20,
+        background: active ? T.redTint : "rgba(255,255,255,0.03)",
+        border: `1px solid ${active ? T.borderHot : T.border}`,
+        color: active ? c : T.textMute,
+        fontSize: 11,
+        fontWeight: 600,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        transition: "all 0.15s",
+      }}
+    >
+      {label}
+      <span style={{ fontSize: 10, color: active ? c : T.textDim, fontFamily: "DM Mono, monospace" }}>{count}</span>
+    </button>
+  );
+}
+
+function ResultsStage(props) {
+  const {
+    file, videoUrl, videoRef, seekFromExternal, videoDuration, setVideoDuration,
+    issues, filteredIssues, activeFilter, setActiveFilter,
+    activeTab, setActiveTab,
+    currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
+    totalErrors, totalWarnings, totalInfo, overallScore, onNewUpload, briefWasUsed,
+  } = props;
+
+  const timedIssues = issues.filter(i => i.ts != null);
+  const checkCounts = useMemo(() => {
+    const c = {};
+    for (const i of issues) c[i.checkId] = (c[i.checkId] || 0) + 1;
+    return c;
+  }, [issues]);
+
+  return (
+    <div className="fade-in">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.01em" }}>QC Report</h2>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+            <p style={{ color: T.textDim, fontSize: 13 }}>
+              {file?.name} · {issues.length} issues · {fmtTs(Math.round(videoDuration))}
+            </p>
+            {briefWasUsed && (
+              <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: T.redTint, color: T.redLight, fontWeight: 700, letterSpacing: "0.04em", border: `1px solid ${T.borderHot}` }}>
+                BRIEF APPLIED ✓
+              </span>
+            )}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onNewUpload} style={{ padding: "9px 18px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
+            ↩ New Upload
+          </button>
+          <button style={{ padding: "9px 18px", borderRadius: 9, background: T.gradient, color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 8px rgba(220,38,38,0.3)" }}>
+            ⬇ Export PDF
+          </button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 24 }}>
+        <StatCard ring score={overallScore} label="Overall Score" />
+        <StatCard value={totalErrors} label="Errors" color={T.redBright} />
+        <StatCard value={totalWarnings} label="Warnings" color="#f59e0b" />
+        <StatCard value={totalInfo} label="Info" color="#10b981" />
+        <StatCard value={timedIssues.length} label="Timed Issues" color={T.redLight} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.6fr) minmax(340px, 1fr)", gap: 20, alignItems: "start" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden" }}>
+            <div style={{ position: "relative", background: "#000", aspectRatio: "16/9" }}>
+              {videoUrl ? (
+                <video
+                  ref={videoRef}
+                  src={videoUrl}
+                  onLoadedMetadata={e => { const d = e.currentTarget.duration; if (isFinite(d) && d > 0) setVideoDuration(d); }}
+                  onTimeUpdate={e => {
+                    if (seekFromExternal.current) { seekFromExternal.current = false; return; }
+                    setCurrentTs(e.currentTarget.currentTime);
+                  }}
+                  style={{ width: "100%", height: "100%", objectFit: "contain", display: "block", background: "#000" }}
+                  controls
+                />
+              ) : (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: T.textDim, fontSize: 14 }}>
+                  No video loaded
+                </div>
+              )}
+              <div style={{ position: "absolute", bottom: 12, right: 12, background: "rgba(0,0,0,0.75)", borderRadius: 6, padding: "4px 10px", fontSize: 12, fontFamily: "DM Mono, monospace", color: "white", pointerEvents: "none", backdropFilter: "blur(6px)" }}>
+                {fmtTs(currentTs ?? 0)} / {fmtTs(videoDuration)}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16, padding: 18 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 14 }}>⏱</span>
+                <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.02em" }}>Issue Timeline</span>
+                <span style={{ fontSize: 11, color: T.textDim }}>· {timedIssues.length} timed issues</span>
+              </div>
+              {currentTs != null && (
+                <span style={{ fontSize: 11, fontFamily: "DM Mono, monospace", color: T.redLight, background: T.redTint, padding: "3px 10px", borderRadius: 20, fontWeight: 700 }}>
+                  ▶ {fmtTs(currentTs)}
+                </span>
+              )}
+            </div>
+            <Timeline
+              issues={issues}
+              currentTs={currentTs}
+              duration={videoDuration}
+              onSeek={(ts) => {
+                setCurrentTs(ts);
+                if (timedIssues.length === 0) return;
+                const closest = timedIssues.reduce((p, c) => Math.abs(c.ts - ts) < Math.abs(p.ts - ts) ? c : p, timedIssues[0]);
+                const snapWindow = Math.max(2, videoDuration * 0.03);
+                if (closest && Math.abs(closest.ts - ts) < snapWindow) seekToIssue(closest);
+              }}
+            />
+            <div style={{ display: "flex", gap: 16, marginTop: 24, flexWrap: "wrap" }}>
+              {Object.entries(SEV).map(([key, s]) => (
+                <div key={key} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: s.dot }} />
+                  <span style={{ fontSize: 11, color: T.textDim, textTransform: "capitalize" }}>{key}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: "transparent", border: `2px solid ${T.purpleBright}` }} />
+                <span style={{ fontSize: 11, color: T.textDim }}>creative idea</span>
+              </div>
+            </div>
+          </div>
+
+          {selectedIssue && (
+            <div style={{ background: T.bgPanel, border: `1px solid ${SEV[selectedIssue.severity].dot}50`, borderRadius: 16, padding: 18 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 10, padding: "3px 9px", borderRadius: 4, background: SEV[selectedIssue.severity].badge, color: SEV[selectedIssue.severity].badgeText, fontWeight: 800, letterSpacing: "0.06em" }}>
+                  {SEV[selectedIssue.severity].label}
+                </span>
+                {selectedIssue.ts != null && (
+                  <span style={{ fontSize: 12, fontFamily: "DM Mono, monospace", color: T.redLight, fontWeight: 600 }}>
+                    ▶ {fmtTs(selectedIssue.ts)}
+                  </span>
+                )}
+                <span style={{ fontSize: 12, color: T.textDim }}>
+                  {CHECKS.find(c => c.id === selectedIssue.checkId)?.icon} {CHECKS.find(c => c.id === selectedIssue.checkId)?.label}
+                </span>
+                <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                  <button onClick={() => navigateIssue("prev")} style={{ padding: "5px 12px", borderRadius: 7, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 11, cursor: "pointer", border: `1px solid ${T.border}` }}>← Prev</button>
+                  <button onClick={() => navigateIssue("next")} style={{ padding: "5px 12px", borderRadius: 7, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 11, cursor: "pointer", border: `1px solid ${T.border}` }}>Next →</button>
+                </div>
+              </div>
+              <p style={{ fontSize: 16, fontWeight: 600, color: "white", lineHeight: 1.4, marginBottom: 12 }}>{selectedIssue.msg}</p>
+              {selectedIssue.fix && (
+                <div style={{ background: T.redTint, border: `1px solid ${T.borderHot}`, borderRadius: 10, padding: 14 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <div style={{ width: 20, height: 20, borderRadius: 5, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>✦</div>
+                    <span style={{ fontSize: 11, fontWeight: 800, color: T.redLight, letterSpacing: "0.06em" }}>HOW TO FIX</span>
+                  </div>
+                  <p style={{ fontSize: 13, color: "rgba(255,255,255,0.8)", lineHeight: 1.6 }}>{selectedIssue.fix}</p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden", position: "sticky", top: 80, maxHeight: "calc(100vh - 100px)", display: "flex", flexDirection: "column" }}>
+          {/* ── Two-tab header: QC Baseline / Creative & Retention ────────── */}
+          <div style={{ display: "flex", borderBottom: `1px solid ${T.border}` }}>
+            {Object.entries(CATEGORIES).map(([catId, cat]) => {
+              const count = issues.filter(i => i.category === catId).length;
+              const isActive = activeTab === catId;
+              return (
+                <button
+                  key={catId}
+                  onClick={() => { setActiveTab(catId); setActiveFilter("all"); }}
+                  style={{
+                    flex: 1,
+                    padding: "14px 16px",
+                    background: isActive ? cat.accentTint : "transparent",
+                    borderBottom: isActive ? `2px solid ${cat.accent}` : "2px solid transparent",
+                    color: isActive ? cat.accent : T.textMute,
+                    cursor: "pointer",
+                    transition: "all 0.15s",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 8,
+                    fontSize: 13,
+                    fontWeight: 700,
+                  }}
+                >
+                  <span style={{ fontSize: 15 }}>{cat.icon}</span>
+                  <span>{cat.label}</span>
+                  <span style={{
+                    fontSize: 10,
+                    padding: "2px 7px",
+                    borderRadius: 20,
+                    background: isActive ? cat.accent + "33" : "rgba(255,255,255,0.06)",
+                    color: isActive ? cat.accent : T.textDim,
+                    fontFamily: "DM Mono, monospace",
+                    fontWeight: 800,
+                  }}>{count}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Tab-specific subhead + secondary filters */}
+          <div style={{ padding: "12px 18px 12px", borderBottom: `1px solid ${T.border}` }}>
+            <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, marginBottom: 10 }}>
+              {CATEGORIES[activeTab].desc}
+            </p>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <FilterChip
+                label="All"
+                count={issues.filter(i => i.category === activeTab).length}
+                active={activeFilter === "all"}
+                onClick={() => setActiveFilter("all")}
+                color={CATEGORIES[activeTab].accent}
+              />
+              {(() => {
+                // Sev counts within the active tab only
+                const inTab = issues.filter(i => i.category === activeTab);
+                const errs = inTab.filter(i => i.severity === "error").length;
+                const warns = inTab.filter(i => i.severity === "warning").length;
+                const infos = inTab.filter(i => i.severity === "info").length;
+                return (
+                  <>
+                    {errs > 0 && <FilterChip label="Errors" count={errs} active={activeFilter === "error"} onClick={() => setActiveFilter("error")} color={T.redBright} />}
+                    {warns > 0 && <FilterChip label="Warnings" count={warns} active={activeFilter === "warning"} onClick={() => setActiveFilter("warning")} color="#f59e0b" />}
+                    {infos > 0 && activeTab === "creative_retention" && (
+                      <FilterChip label="Ideas" count={infos} active={activeFilter === "info"} onClick={() => setActiveFilter("info")} color={T.purpleBright} />
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+
+          {/* Findings list — filtered by tab + secondary filter */}
+          <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+            {filteredIssues.length === 0 ? (
+              <div style={{ padding: "32px 16px", textAlign: "center", color: T.textDim }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>
+                  {activeTab === "qc_technical" ? "🎉" : "💭"}
+                </div>
+                <p style={{ fontSize: 13 }}>
+                  {activeTab === "qc_technical"
+                    ? "No technical issues in this filter"
+                    : "No creative suggestions yet — try a different brief or the Retention preset"}
+                </p>
+              </div>
+            ) : (
+              filteredIssues.map(issue => (
+                <IssueCard
+                  key={issue.id}
+                  issue={issue}
+                  isSelected={selectedIssue?.id === issue.id}
+                  onClick={seekToIssue}
+                />
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. MAIN APP
+// ═════════════════════════════════════════════════════════════════════════════
+
+export default function App() {
+  const [stage, setStage] = useState("upload"); // upload | analyzing | results
+  const [dragOver, setDragOver] = useState(false);
+  const [file, setFile] = useState(null);
+  const [analysisPhase, setAnalysisPhase] = useState("");
+  const [analysisProgress, setAnalysisProgress] = useState({ current: 0, total: 0 });
+  const [analysisError, setAnalysisError] = useState(null);
+  const [issues, setIssues] = useState([]);
+  const [videoDuration, setVideoDuration] = useState(60);
+  const [selectedIssue, setSelectedIssue] = useState(null);
+  const [currentTs, setCurrentTs] = useState(null);
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [activeTab, setActiveTab] = useState("qc_technical"); // qc_technical | creative_retention
+  const [apiStatus, setApiStatus] = useState({ probed: false, ok: false, detail: "" });
+  const [referenceBrief, setReferenceBrief] = useState("");
+  const [activePresetId, setActivePresetId] = useState(null);
+  const [briefWasUsed, setBriefWasUsed] = useState(false);
+
+  const fileRef = useRef(null);
+  const videoRef = useRef(null);
+  const abortRef = useRef(null);
+  const seekFromExternal = useRef(false);
+
+  const videoUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
+  useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    probeApi().then(r => { if (!cancelled) setApiStatus({ probed: true, ok: r.ok, detail: r.detail || "" }); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || currentTs == null) return;
+    if (Math.abs(v.currentTime - currentTs) > 0.3) {
+      seekFromExternal.current = true;
+      v.currentTime = currentTs;
+    }
+  }, [currentTs]);
+
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
+
+  const runAnalysis = useCallback(async (f) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    const briefForThisRun = referenceBrief.trim();
+    setFile(f);
+    setStage("analyzing");
+    setIssues([]);
+    setSelectedIssue(null);
+    setCurrentTs(null);
+    setAnalysisError(null);
+    setActiveFilter("all");
+    setBriefWasUsed(briefForThisRun.length > 0);
+
+    try {
+      setAnalysisPhase("extracting");
+      setAnalysisProgress({ current: 0, total: FRAMES_TO_EXTRACT });
+      const { frames, duration } = await extractFrames(f, FRAMES_TO_EXTRACT, (p) => {
+        setAnalysisProgress({ current: p.current, total: p.total });
+      });
+      setVideoDuration(duration);
+
+      if (controller.signal.aborted) return;
+
+      setAnalysisPhase("analyzing");
+      setAnalysisProgress({ current: 0, total: frames.length });
+
+      const progressTimer = setInterval(() => {
+        setAnalysisProgress(p => ({
+          current: Math.min(p.total - 1, p.current + 1),
+          total: p.total,
+        }));
+      }, 1500);
+
+      let result;
+      try {
+        result = await analyzeFrames(frames, duration, controller.signal, briefForThisRun);
+      } finally {
+        clearInterval(progressTimer);
+      }
+
+      if (controller.signal.aborted) return;
+
+      setAnalysisPhase("finalizing");
+      setAnalysisProgress({ current: frames.length, total: frames.length });
+
+      const sorted = [...result.issues].sort((a, b) => {
+        if (a.ts == null && b.ts == null) return 0;
+        if (a.ts == null) return 1;
+        if (b.ts == null) return -1;
+        return a.ts - b.ts;
+      });
+
+      setIssues(sorted);
+      await new Promise(r => setTimeout(r, 500));
+      setStage("results");
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      console.error("Analysis failed:", e);
+      setAnalysisError(e.message || "Analysis failed");
+    }
+  }, [referenceBrief]);
+
+  const handleFile = useCallback((f) => {
+    if (!f) return;
+    if (!f.type.startsWith("video/")) {
+      alert("Please upload a video file (MP4, MOV, WebM, etc.)");
+      return;
+    }
+    runAnalysis(f);
+  }, [runAnalysis]);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault(); setDragOver(false);
+    const f = e.dataTransfer.files[0]; if (f) handleFile(f);
+  }, [handleFile]);
+
+  const resetUpload = () => {
+    abortRef.current?.abort();
+    setStage("upload"); setFile(null); setIssues([]);
+    setSelectedIssue(null); setCurrentTs(null);
+    setAnalysisError(null); setAnalysisPhase("");
+  };
+
+  const seekToIssue = (issue) => {
+    setSelectedIssue(issue);
+    if (issue.ts != null) setCurrentTs(issue.ts);
+    // If the user clicked a timeline marker for a finding in the OTHER tab,
+    // switch to that tab so the highlighted issue card is actually visible.
+    if (issue.category && issue.category !== activeTab) {
+      setActiveTab(issue.category);
+      setActiveFilter("all");
+    }
+  };
+
+  const navigateIssue = (dir) => {
+    if (!selectedIssue) return;
+    const visible = filteredIssues;
+    const idx = visible.findIndex(i => i.id === selectedIssue.id);
+    if (idx < 0) return;
+    const next = dir === "next" ? visible[idx + 1] : visible[idx - 1];
+    if (next) seekToIssue(next);
+  };
+
+  const totalErrors = issues.filter(i => i.severity === "error").length;
+  const totalWarnings = issues.filter(i => i.severity === "warning").length;
+  const totalInfo = issues.filter(i => i.severity === "info").length;
+  const overallScore = Math.max(0, 100 - totalErrors * 12 - totalWarnings * 4);
+
+  const filteredIssues = useMemo(() => {
+    // First filter: only show findings in the currently active tab/category
+    let list = issues.filter(i => i.category === activeTab);
+    // Second filter: apply the severity / check filter chip if not "all"
+    if (activeFilter !== "all") {
+      if (["error", "warning", "info"].includes(activeFilter)) {
+        list = list.filter(i => i.severity === activeFilter);
+      } else {
+        list = list.filter(i => i.checkId === activeFilter);
+      }
+    }
+    return list;
+  }, [issues, activeTab, activeFilter]);
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
+      <Nav apiStatus={apiStatus} />
+      <div style={{ maxWidth: 1480, margin: "0 auto", padding: "24px" }}>
+        {stage === "upload" && (
+          <UploadStage
+            dragOver={dragOver}
+            setDragOver={setDragOver}
+            handleDrop={handleDrop}
+            handleFile={handleFile}
+            fileRef={fileRef}
+            apiStatus={apiStatus}
+            referenceBrief={referenceBrief}
+            setReferenceBrief={setReferenceBrief}
+            activePresetId={activePresetId}
+            setActivePresetId={setActivePresetId}
+          />
+        )}
+        {stage === "analyzing" && (
+          <AnalyzingStage
+            file={file}
+            phase={analysisPhase}
+            progress={analysisProgress}
+            error={analysisError}
+            onCancel={resetUpload}
+          />
+        )}
+        {stage === "results" && (
+          <ResultsStage
+            file={file}
+            videoUrl={videoUrl}
+            videoRef={videoRef}
+            seekFromExternal={seekFromExternal}
+            videoDuration={videoDuration}
+            setVideoDuration={setVideoDuration}
+            issues={issues}
+            filteredIssues={filteredIssues}
+            activeFilter={activeFilter}
+            setActiveFilter={setActiveFilter}
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            currentTs={currentTs}
+            setCurrentTs={setCurrentTs}
+            selectedIssue={selectedIssue}
+            seekToIssue={seekToIssue}
+            navigateIssue={navigateIssue}
+            totalErrors={totalErrors}
+            totalWarnings={totalWarnings}
+            totalInfo={totalInfo}
+            overallScore={overallScore}
+            onNewUpload={resetUpload}
+            briefWasUsed={briefWasUsed}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
