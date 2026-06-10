@@ -46,11 +46,20 @@ const API_MAX_TOKENS = 8192;
 // batches return (see dedupeIssues).
 const COVERAGE_FPS = 3;          // frames sampled per second of video (dense = miss nothing)
 const MAX_TOTAL_FRAMES = 600;    // hard cap so very long videos don't explode cost/time
-const BATCH_SIZE = 5;            // frames per API call — small = fast & within all limits
-const BATCH_CONCURRENCY = 4;     // how many batch calls run at the same time
+const BATCH_SIZE = 4;            // frames per API call — small = fast, fits Hobby 10s & 4.5MB
+const BATCH_CONCURRENCY = 2;     // low concurrency avoids the rate-limit burst that drops batches
+const BATCH_MAX_RETRIES = 6;     // retry 429 / 5xx / 504 per batch so NOTHING is silently dropped
 const CREATIVE_FRAME_COUNT = 12; // sparse, evenly-spaced frames for the holistic creative pass
 const MAX_FRAME_WIDTH = 1600;    // px; higher = clearer OCR. Small batches keep payloads safe
 const FRAME_JPEG_QUALITY = 0.85; // higher = better OCR on small/stylized text
+
+// ── Cost calculator (shown on the confirm screen before scanning) ─────────────
+// Sonnet 4.5 pricing per million tokens. Vision token usage is estimated from
+// image dimensions: tokens ≈ (width × height) / 750.
+const PRICE_INPUT_PER_MTOK = 3.0;   // claude-sonnet-4-5 input  $/1M tokens
+const PRICE_OUTPUT_PER_MTOK = 15.0; // claude-sonnet-4-5 output $/1M tokens
+const PROMPT_TOKENS_PER_CALL = 2600; // approx tokens for the QC instruction text per call
+const OUTPUT_TOKENS_PER_CALL = 350;  // rough average findings output per call
 
 const CHECKS = [
   { id: "grammar",  label: "Grammar & Spelling",   icon: "✍️", desc: "Captions, titles, on-screen text" },
@@ -285,6 +294,59 @@ async function extractFrames(file, onProgress = () => {}) {
  *   • temperature=0 + an EXHAUSTIVE-PASS PROTOCOL section in the prompt
  *     mandate the same scanning routine every run.
  */
+
+// Abort-aware sleep used by the retry backoff.
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const onAbort = () => { cleanup(); reject(new DOMException("Aborted", "AbortError")); };
+    const cleanup = () => { clearTimeout(t); signal?.removeEventListener("abort", onAbort); };
+    signal?.addEventListener("abort", onAbort);
+  });
+}
+
+// POST to the messages API, retrying transient failures (429 rate-limit, 5xx,
+// 504 Vercel-function-timeout, network blips) with exponential backoff that
+// honours the server's Retry-After header. This is THE fix for silently
+// dropped batches: a rate-limited call now waits and retries instead of
+// vanishing. Throws on a non-retryable error or once retries are exhausted, so
+// the caller can count the failure rather than pretend it found nothing.
+async function postMessages(body, signal, maxRetries = BATCH_MAX_RETRIES) {
+  let attempt = 0;
+  while (true) {
+    let res;
+    try {
+      res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      if (attempt >= maxRetries) throw e;       // network error — retry
+      await sleep(Math.min(1000 * 2 ** attempt, 20000) + Math.round(attempt * 137), signal);
+      attempt++;
+      continue;
+    }
+
+    if (res.ok) return res;
+
+    const retryable = res.status === 429 || res.status === 408 || res.status >= 500;
+    if (retryable && attempt < maxRetries) {
+      const retryAfter = parseFloat(res.headers.get("retry-after"));
+      const waitMs = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : Math.min(1500 * 2 ** attempt, 30000) + Math.round(attempt * 137);
+      await sleep(waitMs, signal);
+      attempt++;
+      continue;
+    }
+    return res; // non-retryable, or out of retries — caller surfaces the error
+  }
+}
+
 async function analyzeFrames(frames, duration, signal, referenceBrief = "", mode = "technical") {
   if (!frames || frames.length === 0) throw new Error("No frames to analyze");
 
@@ -560,17 +622,12 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
     });
   });
 
-  const res = await fetch(API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal,
-    body: JSON.stringify({
-      model: API_MODEL,
-      max_tokens: API_MAX_TOKENS,
-      temperature: API_TEMPERATURE,   // 0 = deterministic; biggest lever for consistency
-      messages: [{ role: "user", content }],
-    }),
-  });
+  const res = await postMessages({
+    model: API_MODEL,
+    max_tokens: API_MAX_TOKENS,
+    temperature: API_TEMPERATURE,   // 0 = deterministic; biggest lever for consistency
+    messages: [{ role: "user", content }],
+  }, signal);
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
@@ -738,7 +795,9 @@ function dedupeIssues(issues) {
 }
 
 // Full pipeline: dense technical batches (parallel) + one creative pass.
-// Returns a flat, deduped, id-reassigned issue list.
+// Returns a flat, deduped, id-reassigned issue list PLUS the count of any
+// frame coverage that failed even after retries — so the UI can warn the user
+// that the report is incomplete instead of silently dropping findings.
 async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgress = () => {}) {
   const batches = chunkFrames(frames, BATCH_SIZE);
   const creativeFrames = sampleEvenly(frames, CREATIVE_FRAME_COUNT);
@@ -747,8 +806,13 @@ async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgres
   const tick = () => { done++; onProgress({ current: done, total: totalCalls }); };
   onProgress({ current: 0, total: totalCalls });
 
-  // Technical batches — bounded concurrency. A failed batch must not sink the
-  // whole report, so each task catches its own error and returns [].
+  let failedFrames = 0;   // frames whose batch failed even after all retries
+  let failedBatches = 0;
+
+  // Technical batches — bounded concurrency. postMessages already retries the
+  // transient failures (429 / 5xx / 504) that used to silently drop batches.
+  // If a batch STILL fails after all retries we record how much coverage was
+  // lost rather than pretending it found nothing.
   const techTasks = batches.map((batch) => async () => {
     if (signal?.aborted) return [];
     try {
@@ -756,7 +820,9 @@ async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgres
       return r.issues;
     } catch (e) {
       if (e.name === "AbortError") throw e;
-      console.warn("[BB QC] batch failed, continuing:", e.message);
+      console.error("[BB QC] batch failed after retries:", e.message);
+      failedBatches += 1;
+      failedFrames += batch.length;
       return [];
     }
   });
@@ -779,7 +845,38 @@ async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgres
   const merged = dedupeIssues([...techResults.flat(), ...creativeIssues]);
   // Reassign stable unique ids after merge (each call numbered from 1).
   merged.forEach((it, i) => { it.id = i + 1; });
-  return { issues: merged };
+  return { issues: merged, failedBatches, failedFrames, totalFrames: frames.length };
+}
+
+// Estimate how many frames, API calls, tokens, and dollars an exhaustive scan
+// of a video will cost — shown on the confirm screen BEFORE scanning. Vision
+// token usage is estimated from the (downscaled) frame dimensions using
+// Anthropic's rule of thumb: tokens ≈ (width × height) / 750.
+function estimateScanCost(durationSec, frameW, frameH) {
+  const duration = durationSec > 0 ? durationSec : 60;
+  const w = frameW > 0 ? frameW : 1280;
+  const h = frameH > 0 ? frameH : 720;
+
+  const frames = Math.max(8, Math.min(MAX_TOTAL_FRAMES, Math.ceil(duration * COVERAGE_FPS)));
+  const scaledW = Math.min(w, MAX_FRAME_WIDTH);
+  const ratio = w > 0 ? scaledW / w : 1;
+  const scaledH = Math.round(h * ratio);
+  const tokensPerImage = Math.round((scaledW * scaledH) / 750);
+
+  const techBatches = Math.ceil(frames / BATCH_SIZE);
+  const creativeFrames = Math.min(frames, CREATIVE_FRAME_COUNT);
+  const totalCalls = techBatches + 1; // + creative pass
+
+  const inputTokens =
+    techBatches * PROMPT_TOKENS_PER_CALL + frames * tokensPerImage +
+    PROMPT_TOKENS_PER_CALL + creativeFrames * tokensPerImage;
+  const outputTokens = totalCalls * OUTPUT_TOKENS_PER_CALL;
+
+  const cost =
+    (inputTokens / 1e6) * PRICE_INPUT_PER_MTOK +
+    (outputTokens / 1e6) * PRICE_OUTPUT_PER_MTOK;
+
+  return { frames, calls: totalCalls, inputTokens, outputTokens, tokensPerImage, cost };
 }
 
 // Quick API connectivity probe used by the upload screen to show a status dot.
@@ -1084,10 +1181,27 @@ function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, a
 
 // Review step shown after a file is picked and BEFORE scanning starts. Lets the
 // user preview the video, set the magic-prompt brief, then explicitly start.
+// Small stat cell used by the cost calculator.
+function Stat({ label, value, highlight }) {
+  return (
+    <div style={{ textAlign: "center" }}>
+      <div style={{ fontSize: 18, fontWeight: 800, color: highlight ? "#34d399" : "white", fontFamily: "DM Mono, monospace" }}>{value}</div>
+      <div style={{ fontSize: 10, color: T.textDim, marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
 function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId }) {
   const briefChars = referenceBrief.length;
   const briefLimit = 4000;
   const sizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : "0";
+
+  // Video metadata (read from the preview element) → live cost estimate.
+  const [meta, setMeta] = useState({ duration: 0, w: 0, h: 0 });
+  const est = useMemo(
+    () => (meta.duration > 0 ? estimateScanCost(meta.duration, meta.w, meta.h) : null),
+    [meta]
+  );
 
   return (
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", minHeight: "calc(100vh - 108px)", paddingTop: 32, paddingBottom: 48 }}>
@@ -1102,15 +1216,54 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
       <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
         <div style={{ borderRadius: 14, overflow: "hidden", border: `1px solid ${T.border}`, background: "#000" }}>
           {videoUrl ? (
-            <video src={videoUrl} controls muted playsInline style={{ width: "100%", display: "block", maxHeight: 300, background: "#000" }} />
+            <video
+              src={videoUrl}
+              controls
+              muted
+              playsInline
+              onLoadedMetadata={e => {
+                const v = e.currentTarget;
+                setMeta({
+                  duration: isFinite(v.duration) ? v.duration : 0,
+                  w: v.videoWidth || 0,
+                  h: v.videoHeight || 0,
+                });
+              }}
+              style={{ width: "100%", display: "block", maxHeight: 300, background: "#000" }}
+            />
           ) : (
             <div style={{ padding: 40, textAlign: "center", color: T.textDim }}>Loading preview…</div>
           )}
         </div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10, gap: 12 }}>
           <span style={{ fontSize: 13, color: "white", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>🎬 {file?.name}</span>
-          <span style={{ fontSize: 12, color: T.textDim, fontFamily: "DM Mono, monospace", flexShrink: 0 }}>{sizeMb} MB</span>
+          <span style={{ fontSize: 12, color: T.textDim, fontFamily: "DM Mono, monospace", flexShrink: 0 }}>
+            {meta.w > 0 ? `${meta.w}×${meta.h} · ` : ""}{meta.duration > 0 ? fmtTs(meta.duration) + " · " : ""}{sizeMb} MB
+          </span>
         </div>
+      </div>
+
+      {/* ── Cost calculator ──────────────────────────────────────────────── */}
+      <div style={{ width: "100%", maxWidth: 540, marginBottom: 20, padding: "14px 16px", borderRadius: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.25)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          <span style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>💰 Estimated cost of this scan</span>
+          <span style={{ fontSize: 10, color: T.textDim }}>Sonnet 4.5 · ${PRICE_INPUT_PER_MTOK}/M in · ${PRICE_OUTPUT_PER_MTOK}/M out</span>
+        </div>
+        {est ? (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 10 }}>
+              <Stat label="Frames scanned" value={est.frames} />
+              <Stat label="API calls" value={est.calls} />
+              <Stat label="Input tokens" value={`~${(est.inputTokens / 1000).toFixed(0)}K`} />
+              <Stat label="Est. cost" value={`$${est.cost.toFixed(2)}`} highlight />
+            </div>
+            <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
+              ≈ <strong style={{ color: "white" }}>${est.cost.toFixed(2)}</strong> for this video ({est.frames} frames at {est.tokensPerImage} tokens each, across {est.calls} batched calls). Real cost varies with how many findings come back. This is deducted from your Anthropic credit.
+            </p>
+          </>
+        ) : (
+          <p style={{ fontSize: 12, color: T.textDim, margin: 0 }}>Reading video length to estimate cost…</p>
+        )}
       </div>
 
       {/* ── Magic prompt tool: Reference Brief / Script / Editor Notes ─────── */}
@@ -1577,6 +1730,7 @@ export default function App() {
   const [analysisPhase, setAnalysisPhase] = useState("");
   const [analysisProgress, setAnalysisProgress] = useState({ current: 0, total: 0 });
   const [analysisError, setAnalysisError] = useState(null);
+  const [analysisWarning, setAnalysisWarning] = useState(null);
   const [issues, setIssues] = useState([]);
   const [videoDuration, setVideoDuration] = useState(60);
   const [selectedIssue, setSelectedIssue] = useState(null);
@@ -1625,6 +1779,7 @@ export default function App() {
     setSelectedIssue(null);
     setCurrentTs(null);
     setAnalysisError(null);
+    setAnalysisWarning(null);
     setActiveFilter("all");
     setBriefWasUsed(briefForThisRun.length > 0);
 
@@ -1663,6 +1818,17 @@ export default function App() {
       });
 
       setIssues(sorted);
+
+      // If any batch failed even after retries, the report is INCOMPLETE — say
+      // so loudly instead of letting the user trust a partial scan.
+      if (result.failedFrames > 0) {
+        setAnalysisWarning(
+          `Heads up: ${result.failedBatches} batch(es) covering ${result.failedFrames} of ${result.totalFrames} frames failed after retries (usually rate limits). Those frames were NOT scanned. Wait a minute and run it again for full coverage.`
+        );
+      } else {
+        setAnalysisWarning(null);
+      }
+
       await new Promise(r => setTimeout(r, 500));
       setStage("results");
     } catch (e) {
@@ -1743,6 +1909,15 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
       <Nav apiStatus={apiStatus} />
       <div style={{ maxWidth: 1480, margin: "0 auto", padding: "24px" }}>
+        {stage === "results" && analysisWarning && (
+          <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.4)", display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 16 }}>⚠️</span>
+            <div style={{ flex: 1 }}>
+              <p style={{ fontSize: 13, fontWeight: 700, color: "#fbbf24", marginBottom: 2 }}>Incomplete scan</p>
+              <p style={{ fontSize: 12, color: T.textMute, lineHeight: 1.5, margin: 0 }}>{analysisWarning}</p>
+            </div>
+          </div>
+        )}
         {stage === "upload" && (
           <UploadStage
             dragOver={dragOver}
