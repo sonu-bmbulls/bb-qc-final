@@ -1,4 +1,4 @@
-# BB QC Studio
+# BB QC Studio Project by Sonu
 
 Video quality control dashboard that **actually reads your video** using Claude's vision API. Extracts frames, runs OCR + spell-check on visible on-screen text, and flags safe-zone violations.
 
