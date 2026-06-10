@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/anthropic/[...path].js": {
+    "api/anthropic/v1/messages.js": {
       "maxDuration": 60
     }
   }
