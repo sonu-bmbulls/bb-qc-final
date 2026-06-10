@@ -35,8 +35,8 @@ const API_MODEL = "claude-sonnet-4-5";   // current Sonnet generation with visio
 const API_TEMPERATURE = 0;               // 0 = deterministic-ish output; the single biggest
                                          // lever for run-to-run consistency
 const API_MAX_TOKENS = 8192;
-const FRAMES_TO_EXTRACT = 20;            // 20 evenly-spaced frames per video
-const MAX_FRAME_WIDTH = 1600;            // px; higher = clearer OCR, more tokens/cost
+const FRAMES_TO_EXTRACT = 8;             // 8 frames: fits Vercel Hobby 10s function limit
+const MAX_FRAME_WIDTH = 1200;            // px; lower keeps payload under Hobby 4.5MB body limit
 
 const CHECKS = [
   { id: "grammar",  label: "Grammar & Spelling",   icon: "✍️", desc: "Captions, titles, on-screen text" },
