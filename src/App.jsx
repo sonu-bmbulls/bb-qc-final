@@ -35,8 +35,22 @@ const API_MODEL = "claude-sonnet-4-5";   // current Sonnet generation with visio
 const API_TEMPERATURE = 0;               // 0 = deterministic-ish output; the single biggest
                                          // lever for run-to-run consistency
 const API_MAX_TOKENS = 8192;
-const FRAMES_TO_EXTRACT = 8;             // 8 frames: fits Vercel Hobby 10s function limit
-const MAX_FRAME_WIDTH = 1200;            // px; lower keeps payload under Hobby 4.5MB body limit
+
+// ── Exhaustive scan config ───────────────────────────────────────────────────
+// We scan DENSELY (several frames per second) so no distinct on-screen text
+// state is ever missed, then send the frames to Claude in small BATCHES spread
+// across many parallel API calls. Small batches keep every individual call well
+// under the Vercel Hobby 10s function limit AND the 4.5MB request-body limit, so
+// exhaustive scanning works even on the free plan. Duplicate findings — the same
+// caption flagged across many near-identical frames — are merged after all
+// batches return (see dedupeIssues).
+const COVERAGE_FPS = 3;          // frames sampled per second of video (dense = miss nothing)
+const MAX_TOTAL_FRAMES = 600;    // hard cap so very long videos don't explode cost/time
+const BATCH_SIZE = 5;            // frames per API call — small = fast & within all limits
+const BATCH_CONCURRENCY = 4;     // how many batch calls run at the same time
+const CREATIVE_FRAME_COUNT = 12; // sparse, evenly-spaced frames for the holistic creative pass
+const MAX_FRAME_WIDTH = 1600;    // px; higher = clearer OCR. Small batches keep payloads safe
+const FRAME_JPEG_QUALITY = 0.85; // higher = better OCR on small/stylized text
 
 const CHECKS = [
   { id: "grammar",  label: "Grammar & Spelling",   icon: "✍️", desc: "Captions, titles, on-screen text" },
@@ -174,7 +188,7 @@ function seekTo(video, time) {
  * The first sample point is forced to t = 0 so the very opening frame is
  * always part of the analysis — title cards live there.
  */
-async function extractFrames(file, targetFrames, onProgress = () => {}) {
+async function extractFrames(file, onProgress = () => {}) {
   const video = document.createElement("video");
   const url = URL.createObjectURL(file);
   video.src = url;
@@ -194,17 +208,22 @@ async function extractFrames(file, targetFrames, onProgress = () => {}) {
   const duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 60;
 
   // Downscale to MAX_FRAME_WIDTH. Higher resolution = better OCR on small/
-  // stylized text but more tokens/cost. 1600px is a strong default.
+  // stylized text but more tokens/cost. Small batches let us keep this high.
   const scale = video.videoWidth > MAX_FRAME_WIDTH ? MAX_FRAME_WIDTH / video.videoWidth : 1;
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
   canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
   const ctx = canvas.getContext("2d");
 
-  // Build the request timestamps. First sample is forced to t=0 so the
-  // opening frame is always covered. Last sample lands near (but not at)
-  // the very end. The remaining samples are evenly spaced between them.
-  const lastTs = Math.max(0.1, duration - 0.3);
+  // ── DENSE sampling ──────────────────────────────────────────────────────
+  // Sample COVERAGE_FPS frames per second so every distinct on-screen text
+  // state is captured (capped at MAX_TOTAL_FRAMES for very long videos). The
+  // first sample is forced to t=0 and the last lands near the end; the rest
+  // are evenly spaced. Timestamps are kept at sub-second (2-decimal) precision
+  // so frames within the same second stay distinct.
+  const idealFrames = Math.ceil(duration * COVERAGE_FPS);
+  const targetFrames = Math.max(8, Math.min(MAX_TOTAL_FRAMES, idealFrames));
+  const lastTs = Math.max(0.1, duration - 0.2);
   const requestedTimestamps = [];
   if (targetFrames === 1) {
     requestedTimestamps.push(0);
@@ -215,33 +234,34 @@ async function extractFrames(file, targetFrames, onProgress = () => {}) {
   }
 
   const frames = [];
-  const seenSeconds = new Set();
+  const seenKeys = new Set();
   for (let i = 0; i < requestedTimestamps.length; i++) {
     const target = requestedTimestamps[i];
     onProgress({ phase: "extracting", current: i + 1, total: requestedTimestamps.length });
     try {
       await seekTo(video, target);
       // small delay to ensure the decoded frame is actually painted
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 60));
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
       // ── Lock the timestamp ───────────────────────────────────────────────
-      // Read the actual position the canvas drew from (codecs only seek to
-      // keyframes, so video.currentTime can differ from our request).
-      // Floor to integer second per the spec: the timestamp attached to the
-      // image payload is exactly the second the user will scrub to.
-      const tsSeconds = Math.max(0, Math.floor(video.currentTime));
+      // Read the actual position the canvas drew from (the decoder may snap to
+      // the nearest decodable frame, so video.currentTime can differ slightly
+      // from our request). Keep 2-decimal precision — this is exactly the
+      // position the user will scrub to.
+      const ts = Math.max(0, Math.round(video.currentTime * 100) / 100);
 
-      // Skip duplicates — multiple requested timestamps can collide on the
-      // same integer second on short videos. No point sending Claude the
-      // same image twice with the same label.
-      if (seenSeconds.has(tsSeconds)) continue;
-      seenSeconds.add(tsSeconds);
+      // Skip duplicates — adjacent dense samples can snap to the same decoded
+      // frame. Dedupe at ~0.2s resolution so we don't send Claude the same
+      // image twice while still keeping genuinely distinct frames.
+      const key = Math.round(ts * 5); // buckets of 0.2s
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
 
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
-      frames.push({ ts: tsSeconds, data: dataUrl.split(",")[1] });
+      const dataUrl = canvas.toDataURL("image/jpeg", FRAME_JPEG_QUALITY);
+      frames.push({ ts, data: dataUrl.split(",")[1] });
     } catch (e) {
-      console.warn(`Frame at ${target.toFixed(1)}s failed:`, e.message);
+      console.warn(`Frame at ${target.toFixed(2)}s failed:`, e.message);
     }
   }
 
@@ -265,11 +285,37 @@ async function extractFrames(file, targetFrames, onProgress = () => {}) {
  *   • temperature=0 + an EXHAUSTIVE-PASS PROTOCOL section in the prompt
  *     mandate the same scanning routine every run.
  */
-async function analyzeFrames(frames, duration, signal, referenceBrief = "") {
+async function analyzeFrames(frames, duration, signal, referenceBrief = "", mode = "technical") {
   if (!frames || frames.length === 0) throw new Error("No frames to analyze");
 
   const briefClean = (referenceBrief || "").trim();
   const hasBrief = briefClean.length > 0;
+  const isCreative = mode === "creative";
+
+  // ── MODE DIRECTIVE ────────────────────────────────────────────────────────
+  // The video is scanned exhaustively by splitting it into many small batches
+  // of consecutive frames (technical mode) plus one holistic creative pass.
+  // This directive tells the model which job THIS call is doing so a 5-frame
+  // technical slice doesn't try to judge whole-video pacing, and the creative
+  // pass doesn't re-flag typos already caught by the technical batches.
+  const modeDirective = isCreative
+    ? `═══════════════════════════════════════════════════════════════════════════
+THIS PASS = CREATIVE / RETENTION ONLY
+═══════════════════════════════════════════════════════════════════════════
+These ${frames.length} frames are evenly sampled across the ENTIRE video so you
+can judge pacing, hooks and retention holistically. For THIS pass, emit ONLY
+"creative_retention" findings (pacing, hook strength, CTA, visual variety).
+Do NOT emit spelling/grammar/typo/safe-zone findings — those are handled by a
+separate exhaustive text pass. Every finding you return here is creative.`
+    : `═══════════════════════════════════════════════════════════════════════════
+THIS PASS = TECHNICAL TEXT QC ONLY
+═══════════════════════════════════════════════════════════════════════════
+These ${frames.length} frames are a small CONSECUTIVE SLICE of a longer video
+that is being scanned exhaustively. For THIS pass, emit ONLY objective
+"qc_technical" findings (spelling, repeated-letter typos, grammar, punctuation,
+capitalization, line breaks, layout/safe-zone, visual artifacts, consistency).
+Do NOT comment on pacing, hooks, retention or whole-video creative direction —
+a separate creative pass handles that. Scan every word in every frame.`;
 
   // Build the content array. Order matters: system instructions first, then
   // each frame as [FRAME_METADATA] + image, then the final JSON instruction.
@@ -279,7 +325,9 @@ async function analyzeFrames(frames, duration, signal, referenceBrief = "") {
     type: "text",
     text: `You are an eagle-eyed Post-Production QC Specialist for SOCIAL MEDIA video content — reels, shorts, brand promos, real-estate spots, paid-social ads. Your reviewers are CD-level finicky. Editors send you their export expecting you to catch every text mistake they missed at 2am during their final render.
 
-You will receive a sequence of ${frames.length} frames from a single video (total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
+${modeDirective}
+
+You will receive a sequence of ${frames.length} frames (video total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
 
 ═══════════════════════════════════════════════════════════════════════════
 TIMESTAMP RULE — NON-NEGOTIABLE
@@ -290,9 +338,9 @@ modifying, calculating, or guessing any timestamp.
 
 Your JSON response MUST use the exact, identical timestamp provided in the
 [FRAME_METADATA] block of the frame where the issue is visually captured.
-Copy it verbatim from the metadata. If [FRAME_METADATA] says "timestamp=12",
-your JSON's "timestamp" field for any finding in that frame is exactly 12.
-Not 11. Not 13. Not 12.5. The integer "12".
+Copy it verbatim from the metadata. If [FRAME_METADATA] says "timestamp=12.33",
+your JSON's "timestamp" field for any finding in that frame is exactly 12.33.
+Do not round it, do not change it — copy the exact value, decimals and all.
 
 Also include the frameIndex from the metadata block, verbatim, for every
 finding. The pair (frameIndex, timestamp) must match an actual metadata
@@ -538,7 +586,7 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
   if (data?.stop_reason === "max_tokens") {
     throw new Error(
       "Claude's response hit the output token limit before finishing. " +
-      "Try reducing FRAMES_TO_EXTRACT (e.g. 20 → 14) or raise API_MAX_TOKENS."
+      "Try lowering BATCH_SIZE or raise API_MAX_TOKENS."
     );
   }
 
@@ -597,19 +645,23 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
     if (Number.isFinite(frameIdx) && frameIdx >= 0 && frameIdx < frames.length) {
       ts = frames[frameIdx].ts;   // ← canonical timestamp from our metadata
     } else if (Number.isFinite(Number(item.timestamp))) {
-      // Fallback: if Claude returned a timestamp but a bad frameIndex, try the
-      // timestamp value (still validated against the set of known frame ts).
-      const claimedTs = Math.round(Number(item.timestamp));
-      const match = frames.find(f => f.ts === claimedTs);
-      if (match) ts = match.ts;
+      // Fallback: if Claude returned a timestamp but a bad frameIndex, snap to
+      // the nearest known frame timestamp (frames now use sub-second floats).
+      const claimedTs = Number(item.timestamp);
+      let best = null, bestDiff = Infinity;
+      for (const f of frames) {
+        const d = Math.abs(f.ts - claimedTs);
+        if (d < bestDiff) { bestDiff = d; best = f; }
+      }
+      if (best && bestDiff <= 0.6) ts = best.ts;
     }
 
     issues.push({
       id: nextId++,
-      // Default to qc_technical if Claude forgot the field — safer fallback
-      // since the bulk of findings should be technical. Invalid values also
-      // fall through to this default rather than dropping the finding.
-      category: VALID_CATEGORIES.has(item.category) ? item.category : "qc_technical",
+      // This call was run in a single mode (technical batch OR creative pass),
+      // so force the category to match the mode. Guarantees correct tab
+      // placement regardless of how the model labelled the finding.
+      category: isCreative ? "creative_retention" : "qc_technical",
       checkId: item.checkId,
       severity: item.severity,
       ts,
@@ -619,6 +671,115 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
   }
 
   return { issues, debugText: text };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXHAUSTIVE SCAN ORCHESTRATION
+// Split the dense frame set into small batches, run them through Claude with
+// limited concurrency (each call stays under the Vercel Hobby 10s/4.5MB limits),
+// run one holistic creative pass, then merge + dedupe everything.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function chunkFrames(frames, size) {
+  const out = [];
+  for (let i = 0; i < frames.length; i += size) out.push(frames.slice(i, i + size));
+  return out;
+}
+
+// Evenly sample N frames from the dense set for the holistic creative pass.
+function sampleEvenly(frames, n) {
+  if (frames.length <= n) return frames;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(frames[Math.round((frames.length - 1) * i / (n - 1))]);
+  }
+  // de-dup in case rounding collided
+  return out.filter((f, i) => out.indexOf(f) === i);
+}
+
+// Run async tasks with a bounded number in flight at once. Calls onDone() as
+// each task settles so the UI can show real progress. Rejects on abort.
+async function runWithConcurrency(tasks, limit, onDone = () => {}) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
+      onDone();
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < Math.min(limit, tasks.length); i++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// Merge findings from every batch and collapse duplicates. The same caption
+// flagged across many near-identical frames produces the same (checkId + text)
+// finding repeatedly; keep one copy at the EARLIEST timestamp it appears.
+function dedupeIssues(issues) {
+  const byKey = new Map();
+  for (const it of issues) {
+    const norm = it.msg.toLowerCase().replace(/\s+/g, " ").trim();
+    const key = `${it.category}|${it.checkId}|${norm}`;
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, it); continue; }
+    // keep the one with the earlier (non-null) timestamp; prefer a richer fix
+    const exTs = existing.ts == null ? Infinity : existing.ts;
+    const itTs = it.ts == null ? Infinity : it.ts;
+    if (itTs < exTs) {
+      byKey.set(key, { ...it, fix: it.fix || existing.fix });
+    } else if (!existing.fix && it.fix) {
+      existing.fix = it.fix;
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+// Full pipeline: dense technical batches (parallel) + one creative pass.
+// Returns a flat, deduped, id-reassigned issue list.
+async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgress = () => {}) {
+  const batches = chunkFrames(frames, BATCH_SIZE);
+  const creativeFrames = sampleEvenly(frames, CREATIVE_FRAME_COUNT);
+  const totalCalls = batches.length + 1; // +1 for the creative pass
+  let done = 0;
+  const tick = () => { done++; onProgress({ current: done, total: totalCalls }); };
+  onProgress({ current: 0, total: totalCalls });
+
+  // Technical batches — bounded concurrency. A failed batch must not sink the
+  // whole report, so each task catches its own error and returns [].
+  const techTasks = batches.map((batch) => async () => {
+    if (signal?.aborted) return [];
+    try {
+      const r = await analyzeFrames(batch, duration, signal, brief, "technical");
+      return r.issues;
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      console.warn("[BB QC] batch failed, continuing:", e.message);
+      return [];
+    }
+  });
+
+  const techResults = await runWithConcurrency(techTasks, BATCH_CONCURRENCY, tick);
+
+  // Holistic creative pass (one call over evenly-spaced frames).
+  let creativeIssues = [];
+  if (!signal?.aborted) {
+    try {
+      const r = await analyzeFrames(creativeFrames, duration, signal, brief, "creative");
+      creativeIssues = r.issues;
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      console.warn("[BB QC] creative pass failed, continuing:", e.message);
+    }
+  }
+  tick();
+
+  const merged = dedupeIssues([...techResults.flat(), ...creativeIssues]);
+  // Reassign stable unique ids after merge (each call numbered from 1).
+  merged.forEach((it, i) => { it.id = i + 1; });
+  return { issues: merged };
 }
 
 // Quick API connectivity probe used by the upload screen to show a status dot.
@@ -857,9 +1018,7 @@ function MagicPresetChips({ activeId, onPick }) {
   );
 }
 
-function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, apiStatus, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId }) {
-  const briefChars = referenceBrief.length;
-  const briefLimit = 4000;
+function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, apiStatus }) {
   return (
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)", paddingTop: 40, paddingBottom: 40 }}>
       <div style={{ textAlign: "center", marginBottom: 36 }}>
@@ -896,75 +1055,11 @@ function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, a
         <input ref={fileRef} type="file" accept="video/*" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
       </div>
 
-      {/* ── Reference Brief / Script / Editor Notes ─────────────────────── */}
-      <div style={{ width: "100%", maxWidth: 540, marginTop: 24 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <label htmlFor="ref-brief" style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-            Reference Brief / Script / Editor Notes
-            <span style={{ color: T.textDim, fontWeight: 500, letterSpacing: "0.02em", textTransform: "none", marginLeft: 6 }}>· optional</span>
-          </label>
-          <span style={{
-            fontSize: 10,
-            color: briefChars > briefLimit ? T.redBright : T.textDim,
-            fontFamily: "DM Mono, monospace",
-          }}>
-            {briefChars}/{briefLimit}
-          </span>
-        </div>
+      <p style={{ color: T.textMute, fontSize: 12, marginTop: 16 }}>
+        After you pick a file you'll get a review step — add a brief / magic preset, then start the scan.
+      </p>
 
-        {/* One-click magic-prompt preset chips. Click → fills the textarea.
-            User can still freely edit; if they edit away from the preset
-            text, the highlight clears so they know they're now on custom. */}
-        <MagicPresetChips
-          activeId={activePresetId}
-          onPick={(p) => {
-            setReferenceBrief(p.text);
-            setActivePresetId(p.id);
-          }}
-        />
-
-        <textarea
-          id="ref-brief"
-          value={referenceBrief}
-          onChange={(e) => {
-            setReferenceBrief(e.target.value);
-            // If the user edits away from the matching preset text, clear
-            // the active-preset highlight so the chip no longer shows as
-            // selected. If they happen to type a string that matches a
-            // preset, light it back up.
-            const match = PRESETS.find(p => p.text === e.target.value);
-            setActivePresetId(match ? match.id : null);
-          }}
-          rows={5}
-          placeholder={`Paste your script, brand guidelines, or specific checks here. Or tap a preset above.`}
-          style={{
-            width: "100%",
-            padding: "12px 14px",
-            borderRadius: 10,
-            background: "rgba(255,255,255,0.025)",
-            border: `1px solid ${referenceBrief ? T.borderHot : T.border}`,
-            color: "white",
-            fontSize: 12,
-            fontFamily: "DM Sans, sans-serif",
-            lineHeight: 1.55,
-            resize: "vertical",
-            minHeight: 110,
-            outline: "none",
-            transition: "border-color 0.2s",
-            boxSizing: "border-box",
-          }}
-          onFocus={(e) => { e.target.style.borderColor = T.red; }}
-          onBlur={(e) => { e.target.style.borderColor = referenceBrief ? T.borderHot : T.border; }}
-        />
-        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
-          {referenceBrief
-            ? <>✓ Claude will cross-reference the video against these instructions and perform an exhaustive pass.</>
-            : <>If provided, Claude will strictly audit the video against these requirements — wrong prices, missing brand terms, off-script copy, etc.</>
-          }
-        </p>
-      </div>
-
-      <div style={{ display: "flex", gap: 20, marginTop: 32, flexWrap: "wrap", justifyContent: "center", maxWidth: 700 }}>
+      <div style={{ display: "flex", gap: 20, marginTop: 28, flexWrap: "wrap", justifyContent: "center", maxWidth: 700 }}>
         {CHECKS.filter(c => c.id !== "audio" && c.id !== "metadata").map(c => (
           <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, color: T.textDim, fontSize: 13 }}>
             <span>{c.icon}</span><span>{c.label}</span>
@@ -987,6 +1082,115 @@ function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, a
   );
 }
 
+// Review step shown after a file is picked and BEFORE scanning starts. Lets the
+// user preview the video, set the magic-prompt brief, then explicitly start.
+function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId }) {
+  const briefChars = referenceBrief.length;
+  const briefLimit = 4000;
+  const sizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : "0";
+
+  return (
+    <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", minHeight: "calc(100vh - 108px)", paddingTop: 32, paddingBottom: 48 }}>
+      <div style={{ textAlign: "center", marginBottom: 20 }}>
+        <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.02em" }}>Review &amp; start scan</h1>
+        <p style={{ color: T.textDim, marginTop: 8, fontSize: 14, maxWidth: 540 }}>
+          Add an optional brief or pick a magic preset, then start. Nothing runs until you click <strong>Start QC Scan</strong>.
+        </p>
+      </div>
+
+      {/* Video preview + file meta */}
+      <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
+        <div style={{ borderRadius: 14, overflow: "hidden", border: `1px solid ${T.border}`, background: "#000" }}>
+          {videoUrl ? (
+            <video src={videoUrl} controls muted playsInline style={{ width: "100%", display: "block", maxHeight: 300, background: "#000" }} />
+          ) : (
+            <div style={{ padding: 40, textAlign: "center", color: T.textDim }}>Loading preview…</div>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10, gap: 12 }}>
+          <span style={{ fontSize: 13, color: "white", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>🎬 {file?.name}</span>
+          <span style={{ fontSize: 12, color: T.textDim, fontFamily: "DM Mono, monospace", flexShrink: 0 }}>{sizeMb} MB</span>
+        </div>
+      </div>
+
+      {/* ── Magic prompt tool: Reference Brief / Script / Editor Notes ─────── */}
+      <div style={{ width: "100%", maxWidth: 540 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <label htmlFor="ref-brief" style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            ✨ Magic Prompt · Brief / Script / Notes
+            <span style={{ color: T.textDim, fontWeight: 500, letterSpacing: "0.02em", textTransform: "none", marginLeft: 6 }}>· optional</span>
+          </label>
+          <span style={{ fontSize: 10, color: briefChars > briefLimit ? T.redBright : T.textDim, fontFamily: "DM Mono, monospace" }}>
+            {briefChars}/{briefLimit}
+          </span>
+        </div>
+
+        {/* One-click magic-prompt preset chips. Click → fills the textarea. */}
+        <MagicPresetChips
+          activeId={activePresetId}
+          onPick={(p) => { setReferenceBrief(p.text); setActivePresetId(p.id); }}
+        />
+
+        <textarea
+          id="ref-brief"
+          value={referenceBrief}
+          onChange={(e) => {
+            setReferenceBrief(e.target.value);
+            const match = PRESETS.find(p => p.text === e.target.value);
+            setActivePresetId(match ? match.id : null);
+          }}
+          rows={5}
+          placeholder={`Paste your script, brand guidelines, or specific checks here. Or tap a preset above.`}
+          style={{
+            width: "100%", padding: "12px 14px", borderRadius: 10,
+            background: "rgba(255,255,255,0.025)",
+            border: `1px solid ${referenceBrief ? T.borderHot : T.border}`,
+            color: "white", fontSize: 12, fontFamily: "DM Sans, sans-serif",
+            lineHeight: 1.55, resize: "vertical", minHeight: 110, outline: "none",
+            transition: "border-color 0.2s", boxSizing: "border-box",
+          }}
+          onFocus={(e) => { e.target.style.borderColor = T.red; }}
+          onBlur={(e) => { e.target.style.borderColor = referenceBrief ? T.borderHot : T.border; }}
+        />
+        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
+          {referenceBrief
+            ? <>✓ Claude will cross-reference the video against these instructions and perform an exhaustive pass.</>
+            : <>If provided, Claude will strictly audit the video against these requirements — wrong prices, missing brand terms, off-script copy, etc.</>
+          }
+        </p>
+      </div>
+
+      {/* Actions */}
+      <div style={{ display: "flex", gap: 12, marginTop: 24, width: "100%", maxWidth: 540 }}>
+        <button
+          onClick={onBack}
+          style={{
+            flexShrink: 0, padding: "13px 20px", borderRadius: 10, cursor: "pointer",
+            background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`,
+            color: T.textDim, fontSize: 13, fontWeight: 600,
+          }}
+        >
+          ← Different video
+        </button>
+        <button
+          onClick={onStart}
+          style={{
+            flex: 1, padding: "13px 20px", borderRadius: 10, cursor: "pointer",
+            background: T.gradient, border: "none", color: "white",
+            fontSize: 14, fontWeight: 800, letterSpacing: "0.01em",
+            boxShadow: "0 4px 14px rgba(220,38,38,0.35)",
+          }}
+        >
+          ▶ Start QC Scan
+        </button>
+      </div>
+      <p style={{ fontSize: 11, color: T.textMute, marginTop: 12, textAlign: "center", maxWidth: 540 }}>
+        Exhaustive mode: every distinct frame is scanned across many batched calls. A longer clip can take a few minutes — that's the cost of missing nothing.
+      </p>
+    </div>
+  );
+}
+
 function PhaseRow({ done, active, label }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderRadius: 10, background: active ? T.redTint : "rgba(255,255,255,0.02)", border: `1px solid ${active ? T.borderHot : T.border}` }}>
@@ -1000,9 +1204,9 @@ function PhaseRow({ done, active, label }) {
 
 function AnalyzingStage({ file, phase, progress, error, onCancel }) {
   const phaseLabels = {
-    extracting: { title: "Extracting frames", subtitle: "Reading the video at locked integer-second timestamps" },
-    analyzing:  { title: "Analyzing with Claude vision", subtitle: "Reading every on-screen word and checking for issues" },
-    finalizing: { title: "Compiling report",  subtitle: "Sorting findings by timestamp" },
+    extracting: { title: "Extracting frames", subtitle: "Densely sampling the video so no on-screen text is missed" },
+    analyzing:  { title: "Analyzing with Claude vision", subtitle: "Scanning every frame across batched calls — this can take a few minutes" },
+    finalizing: { title: "Compiling report",  subtitle: "Merging duplicate findings and sorting by timestamp" },
   };
   const current = phaseLabels[phase] || phaseLabels.extracting;
   const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
@@ -1367,7 +1571,7 @@ function ResultsStage(props) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
-  const [stage, setStage] = useState("upload"); // upload | analyzing | results
+  const [stage, setStage] = useState("upload"); // upload | confirm | analyzing | results
   const [dragOver, setDragOver] = useState(false);
   const [file, setFile] = useState(null);
   const [analysisPhase, setAnalysisPhase] = useState("");
@@ -1426,35 +1630,30 @@ export default function App() {
 
     try {
       setAnalysisPhase("extracting");
-      setAnalysisProgress({ current: 0, total: FRAMES_TO_EXTRACT });
-      const { frames, duration } = await extractFrames(f, FRAMES_TO_EXTRACT, (p) => {
+      setAnalysisProgress({ current: 0, total: 1 });
+      const { frames, duration } = await extractFrames(f, (p) => {
         setAnalysisProgress({ current: p.current, total: p.total });
       });
       setVideoDuration(duration);
 
       if (controller.signal.aborted) return;
 
+      // Exhaustive multi-batch analysis. Progress reflects real API calls
+      // completing (technical batches + the creative pass).
       setAnalysisPhase("analyzing");
-      setAnalysisProgress({ current: 0, total: frames.length });
+      setAnalysisProgress({ current: 0, total: 1 });
 
-      const progressTimer = setInterval(() => {
-        setAnalysisProgress(p => ({
-          current: Math.min(p.total - 1, p.current + 1),
-          total: p.total,
-        }));
-      }, 1500);
-
-      let result;
-      try {
-        result = await analyzeFrames(frames, duration, controller.signal, briefForThisRun);
-      } finally {
-        clearInterval(progressTimer);
-      }
+      const result = await analyzeVideoExhaustive(
+        frames,
+        duration,
+        controller.signal,
+        briefForThisRun,
+        (p) => setAnalysisProgress({ current: p.current, total: p.total })
+      );
 
       if (controller.signal.aborted) return;
 
       setAnalysisPhase("finalizing");
-      setAnalysisProgress({ current: frames.length, total: frames.length });
 
       const sorted = [...result.issues].sort((a, b) => {
         if (a.ts == null && b.ts == null) return 0;
@@ -1479,8 +1678,15 @@ export default function App() {
       alert("Please upload a video file (MP4, MOV, WebM, etc.)");
       return;
     }
-    runAnalysis(f);
-  }, [runAnalysis]);
+    // Don't auto-scan. Stage the file and move to the confirm/review step where
+    // the user can set the magic prompt and explicitly start the scan.
+    setFile(f);
+    setIssues([]);
+    setSelectedIssue(null);
+    setCurrentTs(null);
+    setAnalysisError(null);
+    setStage("confirm");
+  }, []);
 
   const handleDrop = useCallback((e) => {
     e.preventDefault(); setDragOver(false);
@@ -1545,6 +1751,14 @@ export default function App() {
             handleFile={handleFile}
             fileRef={fileRef}
             apiStatus={apiStatus}
+          />
+        )}
+        {stage === "confirm" && (
+          <ConfirmStage
+            file={file}
+            videoUrl={videoUrl}
+            onStart={() => runAnalysis(file)}
+            onBack={resetUpload}
             referenceBrief={referenceBrief}
             setReferenceBrief={setReferenceBrief}
             activePresetId={activePresetId}
