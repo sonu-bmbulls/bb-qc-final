@@ -566,6 +566,17 @@ every analysis. Do not shortcut it.
   PASS 6 — Compile:    Emit one finding object per defect/suggestion.
                        Do not collapse multiple findings into one.
                        Do not omit findings to keep the list short.
+  PASS 7 — Dedup:      Report each distinct defect EXACTLY ONCE. Do NOT file
+                       the same problem from two angles — if a misspelled word
+                       also makes the sentence a fragment (e.g. "is the only
+                       skil"), emit ONE finding, the most specific/actionable
+                       one (the spelling fix "skil" → "skill"), not a separate
+                       spelling AND grammar finding for the same word. If the
+                       identical caption is visible in several of these frames,
+                       report it once and do NOT append notes like "(repeated
+                       across frames 0-1)" — duplicates are merged downstream.
+                       Distinct defects remain distinct findings; this only
+                       forbids repeating the SAME defect.
 
 ═══════════════════════════════════════════════════════════════════════════
 OUTPUT FORMAT — STRICT JSON, NO PROSE
@@ -772,26 +783,87 @@ async function runWithConcurrency(tasks, limit, onDone = () => {}) {
   return results;
 }
 
-// Merge findings from every batch and collapse duplicates. The same caption
-// flagged across many near-identical frames produces the same (checkId + text)
-// finding repeatedly; keep one copy at the EARLIEST timestamp it appears.
+// Merge findings from every batch and collapse duplicates. Two things produce
+// repeated feedback for ONE real mistake:
+//   1. The same caption spans adjacent frames that fall in different batches
+//      (separate API calls), so each call flags it independently.
+//   2. A single defect is reported from two angles — e.g. a misspelled word
+//      flagged once as "Spelling" and again as a "Grammar fragment".
+// Keying on the whole msg missed both: the wording drifts ("...(repeated
+// across frames 0-1)") and the two angles use different checkIds. So we key on
+// the EXACT on-screen text each finding quotes — the true signature of the
+// mistake — and merge any same-category findings whose quoted spans overlap.
+
+// Pull the quoted spans out of a finding's text. Claude is instructed to quote
+// the exact wrong text, so these identify the defect independent of the
+// advisory wording. Keep spans that are a phrase (contain a space) or 4+ chars,
+// so short stopwords ("the", "are") never merge unrelated findings.
+function quotedSpans(text) {
+  const spans = new Set();
+  if (!text) return spans;
+  const re = /["'“”‘’]([^"'“”‘’]{2,}?)["'“”‘’]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const s = m[1].toLowerCase().replace(/\s+/g, " ").trim();
+    if (s.length >= 4 || s.includes(" ")) spans.add(s);
+  }
+  return spans;
+}
+
 function dedupeIssues(issues) {
-  const byKey = new Map();
-  for (const it of issues) {
-    const norm = it.msg.toLowerCase().replace(/\s+/g, " ").trim();
-    const key = `${it.category}|${it.checkId}|${norm}`;
-    const existing = byKey.get(key);
-    if (!existing) { byKey.set(key, it); continue; }
-    // keep the one with the earlier (non-null) timestamp; prefer a richer fix
-    const exTs = existing.ts == null ? Infinity : existing.ts;
-    const itTs = it.ts == null ? Infinity : it.ts;
-    if (itTs < exTs) {
-      byKey.set(key, { ...it, fix: it.fix || existing.fix });
-    } else if (!existing.fix && it.fix) {
-      existing.fix = it.fix;
+  // Of two findings for the same mistake, keep the most useful: prefer a
+  // concrete replacement ("→"), then the earliest timestamp; carry over a fix
+  // from the discarded one if the winner lacks it.
+  const keepBetter = (a, b) => {
+    const aArrow = /→|->/.test(a.msg) ? 1 : 0;
+    const bArrow = /→|->/.test(b.msg) ? 1 : 0;
+    let win, lose;
+    if (aArrow !== bArrow) { [win, lose] = aArrow > bArrow ? [a, b] : [b, a]; }
+    else {
+      const aTs = a.ts == null ? Infinity : a.ts;
+      const bTs = b.ts == null ? Infinity : b.ts;
+      [win, lose] = aTs <= bTs ? [a, b] : [b, a];
+    }
+    return win.fix ? win : (lose.fix ? { ...win, fix: lose.fix } : win);
+  };
+
+  // One node per finding. Quote-less findings get a synthetic span from their
+  // normalized msg so identical-wording dups still merge but distinct ones
+  // never collide.
+  const nodes = issues.map((it) => {
+    const spans = quotedSpans(`${it.msg} ${it.fix || ""}`);
+    if (spans.size === 0) {
+      spans.add("msg:" + it.msg.toLowerCase().replace(/\s+/g, " ").trim());
+    }
+    return { issue: it, cat: it.category, spans };
+  });
+
+  // Iteratively merge same-category nodes whose quoted spans intersect. Finding
+  // counts per video are small, so the simple O(n²) sweep is fine and — unlike
+  // a single pass — it merges transitively (A↔B, B↔C ⇒ A,B,C) regardless of
+  // the order findings arrive in.
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let i = 0; i < nodes.length && !merged; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        if (nodes[i].cat !== nodes[j].cat) continue;
+        let overlap = false;
+        for (const s of nodes[j].spans) {
+          if (nodes[i].spans.has(s)) { overlap = true; break; }
+        }
+        if (overlap) {
+          nodes[i].issue = keepBetter(nodes[i].issue, nodes[j].issue);
+          for (const s of nodes[j].spans) nodes[i].spans.add(s);
+          nodes.splice(j, 1);
+          merged = true;
+          break;
+        }
+      }
     }
   }
-  return Array.from(byKey.values());
+
+  return nodes.map((n) => n.issue);
 }
 
 // Full pipeline: dense technical batches (parallel) + one creative pass.
