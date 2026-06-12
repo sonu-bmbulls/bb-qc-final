@@ -31,33 +31,74 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 // ═════════════════════════════════════════════════════════════════════════════
 
 const API_URL = "/api/anthropic/v1/messages";
-const API_MODEL = "claude-sonnet-4-5";   // current Sonnet generation with vision
 const API_TEMPERATURE = 0;               // 0 = deterministic-ish output; the single biggest
                                          // lever for run-to-run consistency
-const API_MAX_TOKENS = 8192;
+const DEFAULT_MODEL = "claude-sonnet-4-6"; // used by the connectivity probe + as a fallback
+
+// ── SPEED MODES (the user picks one BEFORE scanning) ──────────────────────────
+// Each mode is a pure data record that drives the WHOLE pipeline: which model,
+// how densely to sample frames, how many parallel timeline segments to cut, the
+// per-call response-token budget, whether to run the creative pass, and the HARD
+// wall-clock cap that powers the live countdown + the abort guardrail.
+//
+// Model note: this app calls the Anthropic API (the /api/anthropic proxy), so the
+// fast/cheap tier is Claude Haiku 4.5 and the high-intelligence tier is Claude
+// Sonnet 4.6 — the current vision-capable IDs.
+const MODES = {
+  urgent: {
+    id: "urgent",
+    label: "Urgent Pass",
+    icon: "⚡",
+    blurb: "Objective errors only — spelling, grammar, safe-zones. Fast & cheap.",
+    model: "claude-haiku-4-5",
+    coverageFps: 1,            // sparse sampling = fewer frames = faster
+    maxSegments: 3,
+    maxTokens: 2048,           // small JSON payload → lower latency
+    runCreative: false,        // skip creative/retention entirely
+    priceIn: 1.0,              // Haiku 4.5 $/1M input
+    priceOut: 5.0,             // Haiku 4.5 $/1M output
+    capFormula: (dur) => Math.max(60_000, Math.round(dur) * 2_000),   // 60s → 120s cap
+  },
+  deep: {
+    id: "deep",
+    label: "Deep Audit",
+    icon: "🔬",
+    blurb: "Full audit — typos PLUS hooks, pacing, branding & creative retention.",
+    model: "claude-sonnet-4-6",
+    coverageFps: 2,
+    maxSegments: 4,
+    maxTokens: 8192,
+    runCreative: true,
+    priceIn: 3.0,              // Sonnet 4.6 $/1M input
+    priceOut: 15.0,            // Sonnet 4.6 $/1M output
+    capFormula: (dur) => Math.max(180_000, Math.round(dur) * 6_000),  // 60s → 360s cap
+  },
+};
+const DEFAULT_MODE = "urgent";
+
+// ── Divide & Conquer config ───────────────────────────────────────────────────
+const SEGMENT_TARGET_SEC = 20;   // aim for ~20s per timeline segment (60s video → 3 segments)
+const SEGMENT_OVERLAP_SEC = 1;   // 1s overlap so a caption on a seam isn't sliced in half
+const SEGMENT_TIMEOUT_PAD = 1.4; // a segment's watchdog = its share of the cap × this
 
 // ── Exhaustive scan config ───────────────────────────────────────────────────
-// We scan DENSELY (several frames per second) so no distinct on-screen text
-// state is ever missed, then send the frames to Claude in small BATCHES spread
-// across many parallel API calls. Small batches keep every individual call well
-// under the Vercel Hobby 10s function limit AND the 4.5MB request-body limit, so
-// exhaustive scanning works even on the free plan. Duplicate findings — the same
-// caption flagged across many near-identical frames — are merged after all
-// batches return (see dedupeIssues).
-const COVERAGE_FPS = 3;          // frames sampled per second of video (dense = miss nothing)
+// Within each segment we scan DENSELY and send frames in small BATCHES across
+// parallel API calls. Small batches keep every call under the Vercel Hobby 10s
+// limit AND the 4.5MB body limit. Duplicate findings (same caption across
+// near-identical frames, or across the 1s segment overlaps) are merged by
+// dedupeIssues after everything returns.
+const COVERAGE_FPS = 2;          // default fps (each MODE overrides this per scan)
 const MAX_TOTAL_FRAMES = 600;    // hard cap so very long videos don't explode cost/time
 const BATCH_SIZE = 4;            // frames per API call — small = fast, fits Hobby 10s & 4.5MB
-const BATCH_CONCURRENCY = 2;     // low concurrency avoids the rate-limit burst that drops batches
-const BATCH_MAX_RETRIES = 6;     // retry 429 / 5xx / 504 per batch so NOTHING is silently dropped
+const BATCH_CONCURRENCY = 4;     // batches in flight at once (raised now segments run in parallel)
+const BATCH_MAX_RETRIES = 5;     // retry 429 / 5xx / 504 per batch so NOTHING is silently dropped
 const CREATIVE_FRAME_COUNT = 12; // sparse, evenly-spaced frames for the holistic creative pass
 const MAX_FRAME_WIDTH = 1600;    // px; higher = clearer OCR. Small batches keep payloads safe
 const FRAME_JPEG_QUALITY = 0.85; // higher = better OCR on small/stylized text
 
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
-// Sonnet 4.5 pricing per million tokens. Vision token usage is estimated from
-// image dimensions: tokens ≈ (width × height) / 750.
-const PRICE_INPUT_PER_MTOK = 3.0;   // claude-sonnet-4-5 input  $/1M tokens
-const PRICE_OUTPUT_PER_MTOK = 15.0; // claude-sonnet-4-5 output $/1M tokens
+// Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
+// Per-mode $/1M pricing lives on each MODE above.
 const PROMPT_TOKENS_PER_CALL = 2600; // approx tokens for the QC instruction text per call
 const OUTPUT_TOKENS_PER_CALL = 350;  // rough average findings output per call
 
@@ -162,6 +203,16 @@ function fmtTs(sec) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// Sort issues chronologically; null timestamps sink to the bottom.
+function sortByTs(list) {
+  return [...list].sort((a, b) => {
+    if (a.ts == null && b.ts == null) return 0;
+    if (a.ts == null) return 1;
+    if (b.ts == null) return -1;
+    return a.ts - b.ts;
+  });
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 3. ANALYSIS PIPELINE
 //
@@ -197,7 +248,7 @@ function seekTo(video, time) {
  * The first sample point is forced to t = 0 so the very opening frame is
  * always part of the analysis — title cards live there.
  */
-async function extractFrames(file, onProgress = () => {}) {
+async function extractFrames(file, coverageFps = COVERAGE_FPS, onProgress = () => {}) {
   const video = document.createElement("video");
   const url = URL.createObjectURL(file);
   video.src = url;
@@ -230,7 +281,7 @@ async function extractFrames(file, onProgress = () => {}) {
   // first sample is forced to t=0 and the last lands near the end; the rest
   // are evenly spaced. Timestamps are kept at sub-second (2-decimal) precision
   // so frames within the same second stay distinct.
-  const idealFrames = Math.ceil(duration * COVERAGE_FPS);
+  const idealFrames = Math.ceil(duration * (coverageFps || COVERAGE_FPS));
   const targetFrames = Math.max(8, Math.min(MAX_TOTAL_FRAMES, idealFrames));
   const lastTs = Math.max(0.1, duration - 0.2);
   const requestedTimestamps = [];
@@ -347,49 +398,71 @@ async function postMessages(body, signal, maxRetries = BATCH_MAX_RETRIES) {
   }
 }
 
-async function analyzeFrames(frames, duration, signal, referenceBrief = "", mode = "technical") {
+async function analyzeFrames(frames, duration, signal, referenceBrief = "", pass = "technical", opts = {}) {
   if (!frames || frames.length === 0) throw new Error("No frames to analyze");
 
+  const model = opts.model || DEFAULT_MODEL;
+  const maxTokens = opts.maxTokens || 4096;
   const briefClean = (referenceBrief || "").trim();
   const hasBrief = briefClean.length > 0;
-  const isCreative = mode === "creative";
+  const isCreative = pass === "creative";
 
-  // ── MODE DIRECTIVE ────────────────────────────────────────────────────────
-  // The video is scanned exhaustively by splitting it into many small batches
-  // of consecutive frames (technical mode) plus one holistic creative pass.
-  // This directive tells the model which job THIS call is doing so a 5-frame
-  // technical slice doesn't try to judge whole-video pacing, and the creative
-  // pass doesn't re-flag typos already caught by the technical batches.
-  const modeDirective = isCreative
+  // ── PASS DIRECTIVE ──────────────────────────────────────────────────────────
+  // VOLATILE — tells the model which job THIS call is doing. Lives in the USER
+  // message, never in the cached system block (req #4).
+  const directive = isCreative
     ? `═══════════════════════════════════════════════════════════════════════════
 THIS PASS = CREATIVE / RETENTION ONLY
 ═══════════════════════════════════════════════════════════════════════════
-These ${frames.length} frames are evenly sampled across the ENTIRE video so you
-can judge pacing, hooks and retention holistically. For THIS pass, emit ONLY
-"creative_retention" findings (pacing, hook strength, CTA, visual variety).
-Do NOT emit spelling/grammar/typo/safe-zone findings — those are handled by a
-separate exhaustive text pass. Every finding you return here is creative.`
+These frames are evenly sampled across the ENTIRE video so you can judge pacing,
+hooks and retention holistically. For THIS pass, emit ONLY "creative_retention"
+findings (pacing, hook strength, CTA, visual variety). Do NOT emit spelling/
+grammar/typo/safe-zone findings — a separate exhaustive text pass handles those.`
     : `═══════════════════════════════════════════════════════════════════════════
 THIS PASS = TECHNICAL TEXT QC ONLY
 ═══════════════════════════════════════════════════════════════════════════
-These ${frames.length} frames are a small CONSECUTIVE SLICE of a longer video
-that is being scanned exhaustively. For THIS pass, emit ONLY objective
-"qc_technical" findings (spelling, repeated-letter typos, grammar, punctuation,
-capitalization, line breaks, layout/safe-zone, visual artifacts, consistency).
-Do NOT comment on pacing, hooks, retention or whole-video creative direction —
-a separate creative pass handles that. Scan every word in every frame.`;
+These frames are a small CONSECUTIVE SLICE of a longer video being scanned
+exhaustively. For THIS pass, emit ONLY objective "qc_technical" findings
+(spelling, repeated-letter typos, grammar, punctuation, capitalization, line
+breaks, layout/safe-zone, visual artifacts, consistency). Do NOT comment on
+pacing, hooks, retention or whole-video creative direction — a separate creative
+pass handles that. Scan every word in every frame.`;
 
-  // Build the content array. Order matters: system instructions first, then
-  // each frame as [FRAME_METADATA] + image, then the final JSON instruction.
+  // ── Content array ─────────────────────────────────────────────────────────
+  // content[0] = VOLATILE per-call header (directive + frame count + duration +
+  // optional user brief). Frames are appended after it. The big STATIC ruleset
+  // goes in `system` below so it is cached, not re-sent, on every batch (req #4).
   const content = [];
-
   content.push({
     type: "text",
-    text: `You are an eagle-eyed Post-Production QC Specialist for SOCIAL MEDIA video content — reels, shorts, brand promos, real-estate spots, paid-social ads. Your reviewers are CD-level finicky. Editors send you their export expecting you to catch every text mistake they missed at 2am during their final render.
+    text: `${directive}
 
-${modeDirective}
+You will receive a sequence of ${frames.length} frames (video total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp — copy them verbatim.${hasBrief ? `
 
-You will receive a sequence of ${frames.length} frames (video total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
+═══════════════════════════════════════════════════════════════════════════
+USER-PROVIDED AUDIT INSTRUCTIONS — CROSS-REFERENCE STRICTLY
+═══════════════════════════════════════════════════════════════════════════
+Cross-reference every frame against these instructions IN ADDITION to every
+standard QC rule. If the user indicates a number of errors, or that errors
+definitely exist, do an exhaustive, highly rigorous pass — re-read every frame
+and keep scanning until every defect is catalogued. Choose the right category
+per the brief (creative direction / retention / hooks / pacing → creative_retention;
+typos / grammar / specific words → qc_technical; both → split). Wrong prices,
+names or dates → "error", qc_technical. Tone/phrasing deviations → "warning",
+qc_technical. In the "fix" field, explicitly reference the user's instruction.
+
+THE USER'S INSTRUCTIONS (authoritative for this video):
+<user_instructions>
+${briefClean}
+</user_instructions>` : ""}`,
+  });
+
+  // ── STATIC instruction block (cached) ───────────────────────────────────────
+  // Identical bytes on every call → prompt-cache hit after the first write
+  // (req #4). NO per-call variables in here.
+  const systemText = `You are an eagle-eyed Post-Production QC Specialist for SOCIAL MEDIA video content — reels, shorts, brand promos, real-estate spots, paid-social ads. Your reviewers are CD-level finicky. Editors send you their export expecting you to catch every text mistake they missed at 2am during their final render.
+
+The user message states which pass this is (technical text QC, or creative / retention) and how many frames you are receiving. Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
 
 ═══════════════════════════════════════════════════════════════════════════
 TIMESTAMP RULE — NON-NEGOTIABLE
@@ -508,40 +581,11 @@ finding. "Add a zoom here" is never an error. Conversely, do NOT
 demote a real typo to creative_retention. "Spelling: 'compaaaete'"
 is never just a suggestion.
 
-${hasBrief ? `═══════════════════════════════════════════════════════════════════════════
-USER-PROVIDED AUDIT INSTRUCTIONS — CROSS-REFERENCE STRICTLY
+If the user message includes AUDIT INSTRUCTIONS, treat them as authoritative for
+this video and cross-reference every frame against them in addition to all rules
+above. (When provided, they appear in the user message — not here.)
+
 ═══════════════════════════════════════════════════════════════════════════
-The user has provided these specific audit instructions/notes. You must
-cross-reference the visual text elements against these instructions in
-addition to every standard QC rule above.
-
-If the user indicates a specific number of errors to look for, or mentions
-that errors definitely exist, perform an EXHAUSTING, HIGHLY RIGOROUS pass
-to identify every single text anomaly — re-read every frame, do not stop
-after the first few findings, keep scanning until every defect across all
-${frames.length} frames is catalogued.
-
-Decide the right CATEGORY based on what the brief asks for:
-  • If the brief is about creative direction / retention / hooks / pacing
-    (e.g. "Retention Mode" preset), the resulting findings should go into
-    creative_retention.
-  • If the brief is about typos / grammar / specific words to verify
-    (e.g. "Subtitles Audit" preset), the resulting findings should go
-    into qc_technical.
-  • If the brief covers both, split findings between the two categories
-    based on which kind of finding each one is.
-
-Any deviation from the user's instructions is a finding:
-  • Wrong prices, wrong product/brand names, wrong dates → "error", qc_technical
-  • Tone/phrasing deviations from the brief → "warning", qc_technical
-  • In the "fix" field, explicitly reference the user's instruction
-
-THE USER'S INSTRUCTIONS (treat as authoritative for this video):
-<user_instructions>
-${briefClean}
-</user_instructions>
-
-` : ""}═══════════════════════════════════════════════════════════════════════════
 EXHAUSTIVE-PASS PROTOCOL — RUN THIS EVERY TIME
 ═══════════════════════════════════════════════════════════════════════════
 For consistent results across runs, execute this exact protocol for
@@ -554,7 +598,10 @@ every analysis. Do not shortcut it.
                        rule above (typos, grammar, punctuation, caps,
                        line breaks, layout, consistency). Tag each
                        finding as qc_technical.
-  PASS 3 — Brief:      ${hasBrief ? "Cross-reference every frame against the user's instructions above. Flag every deviation. Tag with appropriate category per the brief." : "(No user instructions provided — skip this pass.)"}
+  PASS 3 — Brief:      If the user message included audit instructions, cross-
+                       reference every frame against them and flag every
+                       deviation, tagging the appropriate category. Otherwise
+                       skip this pass.
   PASS 4 — Sweep:      Re-scan every frame one more time looking
                        specifically for repeated-letter typos. These
                        are the most-missed defect. Tag as qc_technical.
@@ -617,9 +664,7 @@ suggestion, (b) phrasing/styling improvement or rationale.
 If there are zero findings, return [].
 The array order does not matter — the app sorts by timestamp.
 
-Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
-`,
-  });
+Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp verbatim, and return ONLY the JSON array.`;
 
   // Append each frame as: [FRAME_METADATA] block, then the image itself.
   frames.forEach((f, i) => {
@@ -634,9 +679,13 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
   });
 
   const res = await postMessages({
-    model: API_MODEL,
-    max_tokens: API_MAX_TOKENS,
+    model,
+    max_tokens: maxTokens,
     temperature: API_TEMPERATURE,   // 0 = deterministic; biggest lever for consistency
+    // STATIC ruleset in `system` with a cache breakpoint → billed once, then read
+    // from cache on every later batch (prompt caching, req #4). The volatile
+    // header + frames sit in `messages`, AFTER the cached prefix.
+    system: [{ type: "text", text: systemText, cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content }],
   }, signal);
 
@@ -654,7 +703,7 @@ Now the frames follow. Read EVERY metadata block. Copy timestamps verbatim.
   if (data?.stop_reason === "max_tokens") {
     throw new Error(
       "Claude's response hit the output token limit before finishing. " +
-      "Try lowering BATCH_SIZE or raise API_MAX_TOKENS."
+      "Try lowering BATCH_SIZE or raise the mode's maxTokens in MODES."
     );
   }
 
@@ -752,6 +801,33 @@ function chunkFrames(frames, size) {
   const out = [];
   for (let i = 0; i < frames.length; i += size) out.push(frames.slice(i, i + size));
   return out;
+}
+
+// ── DIVIDE & CONQUER: cut the chronological timeline into N segments ──────────
+// How many segments to cut: ~1 per SEGMENT_TARGET_SEC of video, clamped to the
+// mode's maxSegments (and at least 1). 60s → 3 (urgent) / 3 (deep capped at 4).
+function computeSegmentCount(durationSec, maxSegments) {
+  const n = Math.round((durationSec || 0) / SEGMENT_TARGET_SEC) || 1;
+  return Math.max(1, Math.min(maxSegments, n));
+}
+
+// Slice frames into `segCount` equal time windows. Each window (except the
+// first) reaches `overlapSec` BACKWARDS into the previous one, so a caption that
+// sits right on a seam appears in BOTH adjacent segments and can't be missed.
+// Frames keep their absolute ts, so the reducer can sort the whole video back
+// into one chronological timeline with no drift.
+function segmentByTime(frames, segCount, overlapSec) {
+  if (segCount <= 1 || frames.length === 0) return [frames];
+  const dur = frames[frames.length - 1].ts || 0;
+  const width = dur / segCount;
+  const out = [];
+  for (let s = 0; s < segCount; s++) {
+    const lo = s === 0 ? -Infinity : s * width - overlapSec;        // overlap into previous
+    const hi = s === segCount - 1 ? Infinity : (s + 1) * width;
+    const slice = frames.filter((f) => f.ts >= lo && f.ts < hi);
+    if (slice.length) out.push(slice);
+  }
+  return out.length ? out : [frames];
 }
 
 // Evenly sample N frames from the dense set for the holistic creative pass.
@@ -866,89 +942,172 @@ function dedupeIssues(issues) {
   return nodes.map((n) => n.issue);
 }
 
-// Full pipeline: dense technical batches (parallel) + one creative pass.
-// Returns a flat, deduped, id-reassigned issue list PLUS the count of any
-// frame coverage that failed even after retries — so the UI can warn the user
-// that the report is incomplete instead of silently dropping findings.
-async function analyzeVideoExhaustive(frames, duration, signal, brief, onProgress = () => {}) {
-  const batches = chunkFrames(frames, BATCH_SIZE);
-  const creativeFrames = sampleEvenly(frames, CREATIVE_FRAME_COUNT);
-  const totalCalls = batches.length + 1; // +1 for the creative pass
-  let done = 0;
-  const tick = () => { done++; onProgress({ current: done, total: totalCalls }); };
-  onProgress({ current: 0, total: totalCalls });
-
-  let failedFrames = 0;   // frames whose batch failed even after all retries
-  let failedBatches = 0;
-
-  // Technical batches — bounded concurrency. postMessages already retries the
-  // transient failures (429 / 5xx / 504) that used to silently drop batches.
-  // If a batch STILL fails after all retries we record how much coverage was
-  // lost rather than pretending it found nothing.
-  const techTasks = batches.map((batch) => async () => {
-    if (signal?.aborted) return [];
-    try {
-      const r = await analyzeFrames(batch, duration, signal, brief, "technical");
-      return r.issues;
-    } catch (e) {
-      if (e.name === "AbortError") throw e;
-      console.error("[BB QC] batch failed after retries:", e.message);
-      failedBatches += 1;
-      failedFrames += batch.length;
-      return [];
-    }
+// ── REDUCER ───────────────────────────────────────────────────────────────────
+// Combine the JSON outputs from every parallel segment (+ the creative pass)
+// back into ONE chronological timeline: flatten → dedupe (collapses the 1s
+// overlap dupes and cross-angle dupes via quoted-text matching) → sort by
+// absolute timestamp → renumber ids. Pure function of the checkpoint `plan`, so
+// it can be called progressively as each segment lands AND at the very end.
+function reducePlan(plan) {
+  const all = [
+    ...plan.segments.flatMap((s) => s.issues || []),
+    ...(plan.creativeIssues || []),
+  ];
+  const merged = dedupeIssues(all);
+  merged.sort((a, b) => {
+    if (a.ts == null && b.ts == null) return 0;
+    if (a.ts == null) return 1;
+    if (b.ts == null) return -1;
+    return a.ts - b.ts;
   });
-
-  const techResults = await runWithConcurrency(techTasks, BATCH_CONCURRENCY, tick);
-
-  // Holistic creative pass (one call over evenly-spaced frames).
-  let creativeIssues = [];
-  if (!signal?.aborted) {
-    try {
-      const r = await analyzeFrames(creativeFrames, duration, signal, brief, "creative");
-      creativeIssues = r.issues;
-    } catch (e) {
-      if (e.name === "AbortError") throw e;
-      console.warn("[BB QC] creative pass failed, continuing:", e.message);
-    }
-  }
-  tick();
-
-  const merged = dedupeIssues([...techResults.flat(), ...creativeIssues]);
-  // Reassign stable unique ids after merge (each call numbered from 1).
   merged.forEach((it, i) => { it.id = i + 1; });
-  return { issues: merged, failedBatches, failedFrames, totalFrames: frames.length };
+
+  const incomplete = plan.segments.filter((s) => s.status === "failed" || s.status === "aborted");
+  return {
+    issues: merged,
+    failedSegments: incomplete.length,
+    failedFrames: incomplete.reduce((n, s) => n + s.frames.length, 0),
+    totalFrames: plan.frames.length,
+    pendingRemain: plan.segments.some((s) => s.status !== "done"),
+  };
 }
 
-// Estimate how many frames, API calls, tokens, and dollars an exhaustive scan
-// of a video will cost — shown on the confirm screen BEFORE scanning. Vision
-// token usage is estimated from the (downscaled) frame dimensions using
-// Anthropic's rule of thumb: tokens ≈ (width × height) / 750.
-function estimateScanCost(durationSec, frameW, frameH) {
+// ── PARALLEL SEGMENT PIPELINE (Divide & Conquer + guardrails + checkpoint) ────
+// Runs all NOT-YET-DONE segments concurrently. Each segment:
+//   • batches its frames (BATCH_SIZE) and runs those batches with bounded
+//     concurrency;
+//   • has its OWN AbortController + watchdog timer — if the segment lags past
+//     its share of the wall-clock cap, only THAT segment is cancelled, the rest
+//     keep going (latency guardrail);
+//   • is a checkpoint unit: on completion its status + issues are written back
+//     to `plan` and surfaced via onSegmentDone, so finished work survives even
+//     if a sibling fails. Resume = call this again with the same plan; only
+//     pending/failed/aborted segments re-run.
+// The plan object IS the resumable checkpoint (kept in component memory — no DB).
+async function analyzeSegments(plan, signal, cb = {}) {
+  const onProgress = cb.onProgress || (() => {});
+  const onSegmentDone = cb.onSegmentDone || (() => {});
+  const mode = MODES[plan.modeId] || MODES[DEFAULT_MODE];
+  const { frames, duration, brief } = plan;
+
+  const pending = plan.segments.filter((s) => s.status !== "done");
+
+  // Per-segment guardrail: AbortController + watchdog. Each segment gets a share
+  // of the cap (× a small pad) before its own requests are cancelled.
+  const cap = mode.capFormula(duration);
+  const perSegMs = Math.max(20_000, Math.round((cap / Math.max(1, pending.length)) * SEGMENT_TIMEOUT_PAD));
+  pending.forEach((seg) => {
+    seg.ac = new AbortController();
+    seg.collected = [];
+    seg.remaining = 0;
+    seg.hadError = false;
+    seg.done = false;
+    seg._onAbort = () => seg.ac.abort();
+    signal?.addEventListener("abort", seg._onAbort);
+    seg.timer = setTimeout(() => seg.ac.abort(), perSegMs);
+  });
+
+  // Build the global, segment-tagged batch task list.
+  const tagged = [];
+  for (const seg of pending) {
+    const batches = chunkFrames(seg.frames, BATCH_SIZE);
+    seg.remaining = batches.length || 1;
+    if (!batches.length) { seg.remaining = 0; }
+    for (const batch of batches) tagged.push({ seg, batch });
+  }
+
+  const creativeUnit = (mode.runCreative && !plan.creativeDone) ? 1 : 0;
+  const total = Math.max(1, tagged.length + creativeUnit);
+  let units = 0;
+  const tick = () => { units++; onProgress({ current: units, total }); };
+  onProgress({ current: 0, total });
+
+  const finalizeSeg = (seg) => {
+    if (seg.done) return;
+    if (seg.remaining > 0 && !seg.ac.signal.aborted) return;
+    seg.done = true;
+    seg.status = seg.ac.signal.aborted ? "aborted" : (seg.hadError ? "failed" : "done");
+    seg.issues = seg.collected;
+    clearTimeout(seg.timer);
+    signal?.removeEventListener("abort", seg._onAbort);
+    onSegmentDone({ id: seg.id, status: seg.status });
+  };
+
+  const runOne = async ({ seg, batch }) => {
+    if (seg.ac.signal.aborted) { seg.remaining = Math.max(0, seg.remaining - 1); finalizeSeg(seg); return; }
+    try {
+      const r = await analyzeFrames(batch, duration, seg.ac.signal, brief, "technical",
+        { model: mode.model, maxTokens: mode.maxTokens });
+      seg.collected.push(...r.issues);
+    } catch (e) {
+      if (e.name !== "AbortError") { seg.hadError = true; console.error("[BB QC] batch failed:", e.message); }
+    } finally {
+      seg.remaining = Math.max(0, seg.remaining - 1);
+      tick();
+      finalizeSeg(seg);
+    }
+  };
+
+  // FIRE ALL CHUNKS IN PARALLEL. We warm the prompt cache with ONE call first
+  // (so the big static system prompt is written once), THEN fan the rest out
+  // concurrently — they read the cache instead of each re-writing it. Honors
+  // "fire all chunks at once" while avoiding an N-way cache-write stampede.
+  if (tagged.length) {
+    await runOne(tagged[0]);                                       // warm the prompt cache (1 write)
+    await runWithConcurrency(
+      tagged.slice(1).map((t) => () => runOne(t)),                 // then fan the rest out in parallel
+      Math.min(8, Math.max(2, tagged.length))                      // capped so we don't trip rate limits
+    );
+  }
+  pending.forEach(finalizeSeg);   // settle any segment whose batches all early-returned
+
+  // Holistic creative pass (Deep Audit only) — one call over evenly-spaced frames.
+  if (mode.runCreative && !plan.creativeDone && !signal?.aborted) {
+    try {
+      const creativeFrames = sampleEvenly(frames, CREATIVE_FRAME_COUNT);
+      const r = await analyzeFrames(creativeFrames, duration, signal, brief, "creative",
+        { model: mode.model, maxTokens: mode.maxTokens });
+      plan.creativeIssues = r.issues;
+      plan.creativeDone = true;
+    } catch (e) {
+      if (e.name !== "AbortError") console.warn("[BB QC] creative pass failed, continuing:", e.message);
+    }
+    tick();
+  }
+
+  return reducePlan(plan);
+}
+
+// Estimate frames, API calls, tokens, and dollars for THIS mode's scan — shown
+// on the confirm screen BEFORE scanning. Vision tokens ≈ (w × h) / 750 per
+// image. Prompt caching means only the FIRST call pays full instruction tokens;
+// the rest read the cached prefix at ~0.1×, so we discount accordingly.
+function estimateScanCost(durationSec, frameW, frameH, mode) {
+  const cfg = mode || MODES[DEFAULT_MODE];
   const duration = durationSec > 0 ? durationSec : 60;
   const w = frameW > 0 ? frameW : 1280;
   const h = frameH > 0 ? frameH : 720;
 
-  const frames = Math.max(8, Math.min(MAX_TOTAL_FRAMES, Math.ceil(duration * COVERAGE_FPS)));
+  const frames = Math.max(8, Math.min(MAX_TOTAL_FRAMES, Math.ceil(duration * cfg.coverageFps)));
   const scaledW = Math.min(w, MAX_FRAME_WIDTH);
   const ratio = w > 0 ? scaledW / w : 1;
   const scaledH = Math.round(h * ratio);
   const tokensPerImage = Math.round((scaledW * scaledH) / 750);
 
   const techBatches = Math.ceil(frames / BATCH_SIZE);
-  const creativeFrames = Math.min(frames, CREATIVE_FRAME_COUNT);
-  const totalCalls = techBatches + 1; // + creative pass
+  const creativeFrames = cfg.runCreative ? Math.min(frames, CREATIVE_FRAME_COUNT) : 0;
+  const totalCalls = techBatches + (cfg.runCreative ? 1 : 0);
 
-  const inputTokens =
-    techBatches * PROMPT_TOKENS_PER_CALL + frames * tokensPerImage +
-    PROMPT_TOKENS_PER_CALL + creativeFrames * tokensPerImage;
+  // Instruction tokens: 1 full write + the rest at ~0.1× (cache reads).
+  const promptTokens = PROMPT_TOKENS_PER_CALL * (1 + 0.1 * Math.max(0, totalCalls - 1));
+  const inputTokens = promptTokens + (frames + creativeFrames) * tokensPerImage;
   const outputTokens = totalCalls * OUTPUT_TOKENS_PER_CALL;
 
   const cost =
-    (inputTokens / 1e6) * PRICE_INPUT_PER_MTOK +
-    (outputTokens / 1e6) * PRICE_OUTPUT_PER_MTOK;
+    (inputTokens / 1e6) * cfg.priceIn +
+    (outputTokens / 1e6) * cfg.priceOut;
 
-  return { frames, calls: totalCalls, inputTokens, outputTokens, tokensPerImage, cost };
+  return { frames, calls: totalCalls, inputTokens, outputTokens, tokensPerImage, cost, model: cfg.model };
 }
 
 // Quick API connectivity probe used by the upload screen to show a status dot.
@@ -958,7 +1117,7 @@ async function probeApi() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: API_MODEL,
+        model: DEFAULT_MODEL,
         max_tokens: 10,
         messages: [{ role: "user", content: "Reply with the single word: ok" }],
       }),
@@ -976,6 +1135,81 @@ async function probeApi() {
 // ═════════════════════════════════════════════════════════════════════════════
 // 4. UI COMPONENTS
 // ═════════════════════════════════════════════════════════════════════════════
+
+// Live countdown shown DURING analysis. Counts down from the mode's hard
+// wall-clock cap (`capMs`) toward the `deadline` (epoch ms). The guardrail
+// aborts lagging segments around this same cap, so the timer is a real promise
+// to the user, not decoration.
+function Countdown({ deadline, capMs }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!deadline) return;
+    const id = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(id);
+  }, [deadline]);
+  if (!deadline) return null;
+  const remMs = Math.max(0, deadline - now);
+  const pct = capMs > 0 ? Math.max(0, Math.min(100, (remMs / capMs) * 100)) : 0;
+  const danger = remMs <= capMs * 0.2;
+  const over = remMs <= 0;
+  const color = over ? T.redDeep : danger ? T.redBright : "#10b981";
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: T.textDim }}>{over ? "Time cap reached" : "Max time remaining"}</span>
+        <span style={{ fontSize: 22, fontWeight: 800, fontFamily: "DM Mono, monospace", color, letterSpacing: "0.02em" }}>
+          {fmtTs(Math.ceil(remMs / 1000))}
+        </span>
+      </div>
+      <div style={{ height: 4, background: "rgba(255,255,255,0.07)", borderRadius: 4, overflow: "hidden", maxWidth: 320, margin: "0 auto" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 4, transition: "width 0.25s linear" }} />
+      </div>
+    </div>
+  );
+}
+
+// Speed-mode picker shown on the confirm screen. Two mutually-exclusive cards.
+function ModeSelector({ mode, setMode }) {
+  return (
+    <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
+      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>
+        ⚙️ Speed mode
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        {Object.values(MODES).map((m) => {
+          const active = mode === m.id;
+          return (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => setMode(m.id)}
+              style={{
+                textAlign: "left",
+                padding: "14px 16px",
+                borderRadius: 12,
+                cursor: "pointer",
+                background: active ? T.redTint : "rgba(255,255,255,0.025)",
+                border: `1px solid ${active ? T.borderHot : T.border}`,
+                boxShadow: active ? "0 4px 16px rgba(220,38,38,0.18)" : "none",
+                transition: "all 0.15s",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 18 }}>{m.icon}</span>
+                <span style={{ fontSize: 14, fontWeight: 800, color: active ? "white" : T.textMute }}>{m.label}</span>
+                {active && <span style={{ marginLeft: "auto", fontSize: 11, color: T.redLight }}>✓</span>}
+              </div>
+              <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>{m.blurb}</p>
+              <p style={{ fontSize: 10, color: T.textDim, marginTop: 8, fontFamily: "DM Mono, monospace" }}>
+                {m.model.replace("claude-", "")} · {m.coverageFps} fps · {m.runCreative ? "full audit" : "objective only"}
+              </p>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function ScoreRing({ score, size = 64 }) {
   const r = size * 0.4, circ = 2 * Math.PI * r;
@@ -1263,7 +1497,7 @@ function Stat({ label, value, highlight }) {
   );
 }
 
-function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId }) {
+function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId, mode, setMode }) {
   const briefChars = referenceBrief.length;
   const briefLimit = 4000;
   const sizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : "0";
@@ -1271,8 +1505,8 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
   // Video metadata (read from the preview element) → live cost estimate.
   const [meta, setMeta] = useState({ duration: 0, w: 0, h: 0 });
   const est = useMemo(
-    () => (meta.duration > 0 ? estimateScanCost(meta.duration, meta.w, meta.h) : null),
-    [meta]
+    () => (meta.duration > 0 ? estimateScanCost(meta.duration, meta.w, meta.h, MODES[mode]) : null),
+    [meta, mode]
   );
 
   return (
@@ -1315,11 +1549,14 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
         </div>
       </div>
 
+      {/* ── Speed-mode selector ──────────────────────────────────────────── */}
+      <ModeSelector mode={mode} setMode={setMode} />
+
       {/* ── Cost calculator ──────────────────────────────────────────────── */}
       <div style={{ width: "100%", maxWidth: 540, marginBottom: 20, padding: "14px 16px", borderRadius: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.25)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <span style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>💰 Estimated cost of this scan</span>
-          <span style={{ fontSize: 10, color: T.textDim }}>Sonnet 4.5 · ${PRICE_INPUT_PER_MTOK}/M in · ${PRICE_OUTPUT_PER_MTOK}/M out</span>
+          <span style={{ fontSize: 10, color: T.textDim }}>{MODES[mode].label} · {MODES[mode].model.replace("claude-", "")} · ${MODES[mode].priceIn}/M in · ${MODES[mode].priceOut}/M out</span>
         </div>
         {est ? (
           <>
@@ -1427,7 +1664,7 @@ function PhaseRow({ done, active, label }) {
   );
 }
 
-function AnalyzingStage({ file, phase, progress, error, onCancel }) {
+function AnalyzingStage({ file, phase, progress, error, onCancel, deadline, capMs }) {
   const phaseLabels = {
     extracting: { title: "Extracting frames", subtitle: "Densely sampling the video so no on-screen text is missed" },
     analyzing:  { title: "Analyzing with Claude vision", subtitle: "Scanning every frame across batched calls — this can take a few minutes" },
@@ -1460,7 +1697,9 @@ function AnalyzingStage({ file, phase, progress, error, onCancel }) {
             <div style={{ fontSize: 48, marginBottom: 20, animation: "pulse 2s ease-in-out infinite" }}>🔍</div>
             <h2 style={{ fontSize: 26, fontWeight: 700, marginBottom: 6 }}>{current.title}</h2>
             <p style={{ color: T.textDim, fontSize: 13, marginBottom: 8 }}>{current.subtitle}</p>
-            <p style={{ color: T.textMute, fontSize: 12, marginBottom: 32, fontFamily: "DM Mono, monospace" }}>{file?.name}</p>
+            <p style={{ color: T.textMute, fontSize: 12, marginBottom: 24, fontFamily: "DM Mono, monospace" }}>{file?.name}</p>
+
+            <Countdown deadline={deadline} capMs={capMs} />
 
             <div style={{ height: 6, background: "rgba(255,255,255,0.06)", borderRadius: 6, marginBottom: 12, overflow: "hidden" }}>
               <div style={{
@@ -1813,11 +2052,16 @@ export default function App() {
   const [referenceBrief, setReferenceBrief] = useState("");
   const [activePresetId, setActivePresetId] = useState(null);
   const [briefWasUsed, setBriefWasUsed] = useState(false);
+  const [mode, setMode] = useState(DEFAULT_MODE);          // "urgent" | "deep"
+  const [scanDeadline, setScanDeadline] = useState(null);  // epoch ms for the live countdown
+  const [scanCapMs, setScanCapMs] = useState(0);           // total cap (for the countdown bar)
+  const [canResume, setCanResume] = useState(false);       // some segments still pending/failed
 
   const fileRef = useRef(null);
   const videoRef = useRef(null);
   const abortRef = useRef(null);
   const seekFromExternal = useRef(false);
+  const checkpointRef = useRef(null);                      // the resumable scan plan (in memory)
 
   const videoUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
   useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
@@ -1839,12 +2083,25 @@ export default function App() {
 
   useEffect(() => () => { abortRef.current?.abort(); }, []);
 
+  // Shared post-run handling: surface incomplete coverage + offer Resume.
+  const finishRun = useCallback((result) => {
+    if (result.failedFrames > 0 || result.pendingRemain) {
+      setCanResume(true);
+      setAnalysisWarning(
+        `${result.failedSegments} segment(s) covering ${result.failedFrames} of ${result.totalFrames} frames didn't finish (timeout or rate limit). The segments that completed are saved — click Resume to retry ONLY the missing ones.`
+      );
+    } else {
+      setAnalysisWarning(null);
+    }
+  }, []);
+
   const runAnalysis = useCallback(async (f) => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
     const briefForThisRun = referenceBrief.trim();
+    const cfg = MODES[mode];
     setFile(f);
     setStage("analyzing");
     setIssues([]);
@@ -1853,62 +2110,100 @@ export default function App() {
     setAnalysisError(null);
     setAnalysisWarning(null);
     setActiveFilter("all");
+    setCanResume(false);
     setBriefWasUsed(briefForThisRun.length > 0);
 
     try {
       setAnalysisPhase("extracting");
       setAnalysisProgress({ current: 0, total: 1 });
-      const { frames, duration } = await extractFrames(f, (p) => {
+      const { frames, duration } = await extractFrames(f, cfg.coverageFps, (p) => {
         setAnalysisProgress({ current: p.current, total: p.total });
       });
       setVideoDuration(duration);
-
       if (controller.signal.aborted) return;
 
-      // Exhaustive multi-batch analysis. Progress reflects real API calls
-      // completing (technical batches + the creative pass).
+      // DIVIDE: cut the timeline into chronological segments (1s overlap). The
+      // `plan` IS the resumable checkpoint, kept in memory (no DB).
+      const segCount = computeSegmentCount(duration, cfg.maxSegments);
+      const segFrames = segmentByTime(frames, segCount, SEGMENT_OVERLAP_SEC);
+      const plan = {
+        modeId: mode,
+        frames,
+        duration,
+        brief: briefForThisRun,
+        segments: segFrames.map((fr, i) => ({ id: i, frames: fr, status: "pending", issues: [] })),
+        creativeDone: false,
+        creativeIssues: [],
+      };
+      checkpointRef.current = plan;
+
+      // Start the live countdown against this mode's hard cap.
+      const capMs = cfg.capFormula(duration);
+      setScanCapMs(capMs);
+      setScanDeadline(Date.now() + capMs);
+
       setAnalysisPhase("analyzing");
       setAnalysisProgress({ current: 0, total: 1 });
 
-      const result = await analyzeVideoExhaustive(
-        frames,
-        duration,
-        controller.signal,
-        briefForThisRun,
-        (p) => setAnalysisProgress({ current: p.current, total: p.total })
-      );
+      // CONQUER: run all segments in parallel; merge progressively as each lands.
+      const result = await analyzeSegments(plan, controller.signal, {
+        onProgress: (p) => setAnalysisProgress(p),
+        onSegmentDone: () => setIssues(sortByTs(reducePlan(plan).issues)),
+      });
 
       if (controller.signal.aborted) return;
 
       setAnalysisPhase("finalizing");
-
-      const sorted = [...result.issues].sort((a, b) => {
-        if (a.ts == null && b.ts == null) return 0;
-        if (a.ts == null) return 1;
-        if (b.ts == null) return -1;
-        return a.ts - b.ts;
-      });
-
-      setIssues(sorted);
-
-      // If any batch failed even after retries, the report is INCOMPLETE — say
-      // so loudly instead of letting the user trust a partial scan.
-      if (result.failedFrames > 0) {
-        setAnalysisWarning(
-          `Heads up: ${result.failedBatches} batch(es) covering ${result.failedFrames} of ${result.totalFrames} frames failed after retries (usually rate limits). Those frames were NOT scanned. Wait a minute and run it again for full coverage.`
-        );
-      } else {
-        setAnalysisWarning(null);
-      }
-
-      await new Promise(r => setTimeout(r, 500));
+      setIssues(sortByTs(result.issues));
+      finishRun(result);
+      setScanDeadline(null);
+      await new Promise((r) => setTimeout(r, 400));
       setStage("results");
     } catch (e) {
+      setScanDeadline(null);
       if (e.name === "AbortError") return;
       console.error("Analysis failed:", e);
       setAnalysisError(e.message || "Analysis failed");
     }
-  }, [referenceBrief]);
+  }, [referenceBrief, mode, finishRun]);
+
+  // RESUME: re-run ONLY the segments still pending/failed/aborted. Completed
+  // segments + their findings are preserved in checkpointRef.
+  const resumeAnalysis = useCallback(async () => {
+    const plan = checkpointRef.current;
+    if (!plan) return;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const cfg = MODES[plan.modeId] || MODES[DEFAULT_MODE];
+
+    setStage("analyzing");
+    setAnalysisPhase("analyzing");
+    setAnalysisError(null);
+    setAnalysisWarning(null);
+    setCanResume(false);
+    const capMs = cfg.capFormula(plan.duration);
+    setScanCapMs(capMs);
+    setScanDeadline(Date.now() + capMs);
+
+    try {
+      const result = await analyzeSegments(plan, controller.signal, {
+        onProgress: (p) => setAnalysisProgress(p),
+        onSegmentDone: () => setIssues(sortByTs(reducePlan(plan).issues)),
+      });
+      if (controller.signal.aborted) return;
+      setAnalysisPhase("finalizing");
+      setIssues(sortByTs(result.issues));
+      finishRun(result);
+      setScanDeadline(null);
+      await new Promise((r) => setTimeout(r, 400));
+      setStage("results");
+    } catch (e) {
+      setScanDeadline(null);
+      if (e.name === "AbortError") return;
+      setAnalysisError(e.message || "Resume failed");
+    }
+  }, [finishRun]);
 
   const handleFile = useCallback((f) => {
     if (!f) return;
@@ -1936,6 +2231,7 @@ export default function App() {
     setStage("upload"); setFile(null); setIssues([]);
     setSelectedIssue(null); setCurrentTs(null);
     setAnalysisError(null); setAnalysisPhase("");
+    setCanResume(false); setScanDeadline(null); checkpointRef.current = null;
   };
 
   const seekToIssue = (issue) => {
@@ -1988,6 +2284,14 @@ export default function App() {
               <p style={{ fontSize: 13, fontWeight: 700, color: "#fbbf24", marginBottom: 2 }}>Incomplete scan</p>
               <p style={{ fontSize: 12, color: T.textMute, lineHeight: 1.5, margin: 0 }}>{analysisWarning}</p>
             </div>
+            {canResume && (
+              <button
+                onClick={resumeAnalysis}
+                style={{ flexShrink: 0, alignSelf: "center", padding: "8px 18px", borderRadius: 9, background: "#f59e0b", color: "#1a1205", fontSize: 12, fontWeight: 800, cursor: "pointer", border: "none" }}
+              >
+                ↻ Resume missing segments
+              </button>
+            )}
           </div>
         )}
         {stage === "upload" && (
@@ -2010,6 +2314,8 @@ export default function App() {
             setReferenceBrief={setReferenceBrief}
             activePresetId={activePresetId}
             setActivePresetId={setActivePresetId}
+            mode={mode}
+            setMode={setMode}
           />
         )}
         {stage === "analyzing" && (
@@ -2019,6 +2325,8 @@ export default function App() {
             progress={analysisProgress}
             error={analysisError}
             onCancel={resetUpload}
+            deadline={scanDeadline}
+            capMs={scanCapMs}
           />
         )}
         {stage === "results" && (
