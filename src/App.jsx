@@ -1849,7 +1849,7 @@ function Nav({ apiStatus, user, onLogout }) {
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ width: 36, height: 36, borderRadius: 9, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, letterSpacing: "-0.02em", boxShadow: "0 4px 12px rgba(220,38,38,0.3)" }}>BB</div>
           <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
-            <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.01em" }}>BB QC Studio</span>
+            <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.01em" }}>BB QC Labs</span>
             <span style={{ fontSize: 10, color: T.textDim, letterSpacing: "0.04em" }}>Video Quality Control</span>
           </div>
         </div>
@@ -2530,14 +2530,14 @@ function LoginStage({ onLogin }) {
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)" }}>
       <div style={{ width: "100%", maxWidth: 420, textAlign: "center" }}>
         <div style={{ width: 54, height: 54, borderRadius: 14, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, margin: "0 auto 20px", boxShadow: "0 6px 18px rgba(220,38,38,0.35)" }}>BB</div>
-        <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.02em" }}>Welcome to BB QC Studio</h1>
+        <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.02em" }}>Welcome to BB QC Labs</h1>
         <p style={{ color: T.textDim, marginTop: 10, fontSize: 14, lineHeight: 1.5 }}>Enter your name to open your QC workspace. Your scans are saved here for 7 days.</p>
         <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 12 }}>
           <input
             autoFocus value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-            placeholder="Your name (e.g. Akshay)"
+            placeholder="Enter your name"
             style={{ padding: "14px 16px", borderRadius: 12, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, color: "white", fontSize: 15, outline: "none", textAlign: "center", boxSizing: "border-box" }}
           />
           <button onClick={submit} disabled={!name.trim()}
