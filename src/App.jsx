@@ -513,15 +513,26 @@ the intended word is unambiguous.
 OTHER DEFECTS TO CATCH
 ═══════════════════════════════════════════════════════════════════════════
 1. Spelling — missing/extra/transposed letters, homophones, wrong-word
-   substitutions ("there"/"their").
-2. Grammar & sentence formation — broken construction, missing articles,
-   subject-verb disagreement, tense shifts, run-on captions.
+   substitutions ("there"/"their"). INCLUDING context-driven near-homophone
+   typos: a word spelled as a real but WRONG word that the surrounding meaning
+   rules out — e.g. "mazboor" (forced/helpless) where "mazboot" (strong) is
+   clearly intended in "mazboor neev hote hain" → "mazboot neev" (a foundation
+   is strong, not forced). Flag as "error" and give the corrected word. (This
+   tool sees only the on-screen TEXT, not the audio — judge intent from the
+   meaning of the visible sentence.)
+2. Grammar — ONLY within a single, clearly COMPLETE on-screen sentence:
+   subject-verb disagreement, wrong tense, genuine run-on captions. Do NOT
+   flag a caption for being a fragment, "incomplete", or "missing a verb /
+   subject / predicate" — kinetic captions reveal text a word/phrase at a
+   time, so a single frame showing "control", "Using", or "it allows you" is
+   an ANIMATION STATE, not a grammar error. See DO NOT FLAG.
 3. Punctuation — missing terminal punctuation, missing commas, stray
    or doubled punctuation.
 4. Capitalization — inconsistent across frames, random mid-word capitals,
    ALL CAPS where Title Case was intended.
-5. Line breaks — text broken at awkward points (article split from its
-   noun), widow/orphan single words.
+5. Line breaks — within a complete caption, text broken at an awkward point
+   (an article split from its noun). Do NOT treat an animated single-word
+   reveal as a widow/orphan.
 6. Layout — text touching/crossing the title-safe boundary (outer 5%),
    text overlapping other graphics, illegible from low contrast.
 7. Consistency — same word or brand spelled/styled differently across
@@ -536,6 +547,18 @@ DO NOT FLAG
   "karenge", "Maan lo") — these are the register, not typos.
 • Clearly intentional stylistic choices (artistic kerning, decorative
   all-caps for emphasis on a single word).
+• ANIMATION FRAGMENTS — THE #1 FALSE POSITIVE, ZERO TOLERANCE. Captions in
+  this content animate IN and OUT one word or phrase at a time, so any single
+  frame can show a PARTIAL sentence ("control", "Using", "Using PropFirm
+  Leverage", "it allows you", "capital."). This is normal editing, never an
+  error. NEVER emit a finding whose point is that the text is an "incomplete
+  sentence", "sentence fragment", "standalone word", "missing subject / verb /
+  predicate / object", "missing context or continuation", or that it "needs a
+  complete clause". Only flag a defect that is WRONG INSIDE THE VISIBLE TEXT
+  ITSELF: a misspelling, a repeated-letter typo, a wrong/near-homophone word,
+  broken punctuation inside an otherwise-complete line, or a safe-zone/layout
+  problem. If the only thing "wrong" is that the phrase is cut short, say
+  nothing.
 
 ═══════════════════════════════════════════════════════════════════════════
 TWO CATEGORIES OF FINDING — KEEP THEM SEPARATE
