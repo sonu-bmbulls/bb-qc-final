@@ -592,6 +592,18 @@ ${audioText}` : ""}`,
 The user message states which pass this is (technical text QC, or creative / retention) and how many frames you are receiving. Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
 
 ═══════════════════════════════════════════════════════════════════════════
+LANGUAGE OF OUTPUT — LATIN HINGLISH ONLY (ABSOLUTE)
+═══════════════════════════════════════════════════════════════════════════
+Every finding ("msg" and "fix") MUST be written in LATIN script only. NEVER
+output Devanagari / Hindi characters anywhere — no शब्दों, no फॉरेक्स, no
+मज़बूत, none. Always transliterate Hindi to Latin Hinglish instead:
+  • शब्दों → "shabdon"    • फॉरेक्स → "forex"    • मज़बूत → "mazboot"
+  • नींव → "neev"         • रिज़र्व → "reserves"  • माने → "maane"
+This applies to quoting the AUDIO too: write what the voiceover says in Latin
+Hinglish, never in Devanagari. A finding that contains any Devanagari character
+is INVALID.
+
+═══════════════════════════════════════════════════════════════════════════
 TIMESTAMP RULE — NON-NEGOTIABLE
 ═══════════════════════════════════════════════════════════════════════════
 Each frame has a hardcoded, designated timestamp metadata property in its
@@ -709,8 +721,10 @@ DO NOT FLAG
   complete clause". Only flag a defect that is WRONG INSIDE THE VISIBLE TEXT
   ITSELF: a misspelling, a repeated-letter typo, a wrong/near-homophone word,
   broken punctuation inside an otherwise-complete line, or a safe-zone/layout
-  problem. If the only thing "wrong" is that the phrase is cut short, say
-  nothing.
+  problem. If the only thing "wrong" is that the phrase or a word is cut short /
+  truncated mid-word (e.g. "econo" for "economy"), say NOTHING — UNLESS the
+  AUDIO clearly speaks the full word, in which case report it as an AUDIO
+  MISMATCH, never as an "incomplete caption" or "cut off mid-word".
 
 ═══════════════════════════════════════════════════════════════════════════
 TWO CATEGORIES OF FINDING — KEEP THEM SEPARATE
