@@ -1204,17 +1204,32 @@ function dedupeIssues(issues) {
   return nodes.map((n) => n.issue);
 }
 
+// Deterministically reject the "caption shows less than the audio" false
+// positive (e.g. caption "kisi bhi desh ki economic security" while the audio
+// continues "...currency stability aur global credibility"). Captions reveal
+// progressively and lag the voiceover, so a caption that is a leading SUBSET of
+// what the audio says is NOT an error. We drop these in code rather than trusting
+// the model to always obey the prompt — this is what makes runs converge.
+function isProgressiveCaptionFalsePositive(it) {
+  const norm = (s) => (s || "").toLowerCase().replace(/[.,!?;:"'“”‘’]/g, "").replace(/\s+/g, " ").trim();
+  const cap = norm(it.captionText), aud = norm(it.audioText);
+  // caption is a leading subset of the spoken phrase → progressive reveal
+  if (cap && aud && aud.length > cap.length + 3 && aud.startsWith(cap)) return true;
+  // explicit "incomplete vs audio / does not progress / audio continues" wording
+  const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
+  return /caption (text )?incomplete|incomplete[^.]*caption|shows only|only the first|first phrase|does ?n.?t progress|not progress|audio continues|caption (does not|doesn.?t) (show|progress)|partial sentence|continues with/.test(m);
+}
+
 // ── REDUCER ───────────────────────────────────────────────────────────────────
 // Combine the JSON outputs from every parallel segment (+ the creative pass)
-// back into ONE chronological timeline: flatten → dedupe (collapses the 1s
-// overlap dupes and cross-angle dupes via quoted-text matching) → sort by
-// absolute timestamp → renumber ids. Pure function of the checkpoint `plan`, so
-// it can be called progressively as each segment lands AND at the very end.
+// back into ONE chronological timeline: flatten → drop progressive-reveal false
+// positives → dedupe → sort by absolute timestamp → renumber ids. Pure function
+// of the checkpoint `plan`, so it can run progressively AND at the very end.
 function reducePlan(plan) {
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ];
+  ].filter((it) => !isProgressiveCaptionFalsePositive(it));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
