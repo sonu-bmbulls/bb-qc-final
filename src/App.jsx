@@ -103,9 +103,10 @@ const AUDIO_SAMPLE_RATE = 16000;  // mono 16kHz is plenty for ASR and keeps WAV 
 const AUDIO_CHUNK_SEC = 90;       // 90s mono-16k WAV ≈ 2.9MB, under Vercel's 4.5MB body cap
 
 // ── Animation verification ────────────────────────────────────────────────────
-const VERIFY_WINDOW_SEC = 1.5;    // ± seconds of neighbouring frames used to confirm
-                                  // whether a "truncated/incomplete" finding is just a
-                                  // caption still animating in (then it's dropped)
+const VERIFY_WINDOW_SEC = 1.5;    // seconds of frames BEFORE a finding to include when verifying
+const VERIFY_FORWARD_SEC = 6;     // seconds AHEAD to look — captions reveal progressively and lag
+                                  // the voiceover, so the "missing" text often appears a few
+                                  // seconds later; we must look far enough ahead to see it
 
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
@@ -671,6 +672,16 @@ audio says AND the difference changes meaning. The classic case:
   • audio says "mazboot" (strong) but the caption reads "mazboor" (forced) →
     "error". msg format: Audio mismatch: caption "mazboor" but voiceover says
     "mazboot" → "mazboot". Use checkId "grammar", severity "error".
+
+ONLY FLAG SUBSTITUTIONS — never "missing" text:
+  • Flag ONLY a wrong/substituted word that IS visible on screen (mazboor for
+    mazboot). NEVER flag because the caption shows LESS than the audio, is
+    "incomplete", "does not progress", or is "missing" the rest of the spoken
+    phrase. Captions reveal PROGRESSIVELY and LAG behind the voiceover — the
+    remaining words appear in LATER frames that THIS slice cannot see.
+  • A caption that shows a correct SUBSET of what the audio says is CORRECT.
+  • You only see a few frames — NEVER claim a caption "does not progress" or
+    "does not show X in any frame". You cannot know what the other frames show.
 
 BE CONSERVATIVE — speech-to-text is imperfect and timing can drift:
   • Do NOT flag normal Hinglish spelling variants, filler words, or rephrasings
@@ -1285,24 +1296,30 @@ async function analyzeSegments(plan, signal, cb = {}) {
 // as-is, so this stays cheap.
 function isAnimationSuspect(it) {
   const m = (it.msg || "").toLowerCase();
-  return /incomplete|truncat|cut[\s-]?off|mid-?word|cut short|partial word|\bfragment\b/.test(m);
+  return /incomplete|truncat|cut[\s-]?off|mid-?word|cut short|partial|\bfragment\b|does ?n.?t progress|not progress|does ?n.?t show|not shown|missing|full phrase|continue/.test(m);
 }
 
 async function verifyFinding(it, frames, transcript, signal, opts = {}) {
   const model = opts.model || DEFAULT_MODEL;
   const ts = it.ts ?? 0;
-  const lo = ts - VERIFY_WINDOW_SEC, hi = ts + VERIFY_WINDOW_SEC;
-  const window = frames.filter((f) => f.ts >= lo && f.ts <= hi);
+  const lo = ts - VERIFY_WINDOW_SEC, hi = ts + VERIFY_FORWARD_SEC;
+  let window = frames.filter((f) => f.ts >= lo && f.ts <= hi);
   if (window.length < 2) return { real: true };   // not enough context to refute → keep
+  if (window.length > 12) window = sampleEvenly(window, 12);
 
   const audio = transcript ? transcriptWindow(transcript, lo, hi) : "";
   const content = [{
     type: "text",
-    text: `These ${window.length} frames are CONSECUTIVE, spanning a ~${VERIFY_WINDOW_SEC * 2}s window of a video whose on-screen captions animate IN one word/phrase at a time. A previous QC pass flagged this at ${fmtTs(ts)}:
+    text: `These ${window.length} frames are in chronological order, spanning ${fmtTs(lo)}–${fmtTs(hi)} of a video whose captions animate IN progressively — one word/phrase at a time — and LAG behind the voiceover. A previous QC pass flagged this at ${fmtTs(ts)}:
 
 FLAGGED: ${it.msg}
 
-The caption's TRUE text is its MOST COMPLETE state across these frames. A word that looks cut short in an early frame but COMPLETES in a later frame is an ANIMATION REVEAL — in that case the finding is NOT real. Output Latin-script Hinglish only (never Devanagari).${audio ? `\n\nAUDIO (voiceover) for this window:\n${audio}` : ""}
+Judge against the caption's MOST COMPLETE state across ALL of these frames:
+  • A word cut short early but that COMPLETES in a later frame ("econo"→"economy") is an animation reveal → NOT real.
+  • Text the caption seems to be MISSING early but that APPEARS in a later frame (the sentence continuing, e.g. "currency stability aur global credibility") is progressive reveal → NOT real.
+  • A caption showing a correct SUBSET of what the audio says is fine → NOT real.
+  • REAL only if a clearly VISIBLE word is wrong/misspelled, OR the "missing" text NEVER appears in any of these frames.
+Output Latin-script Hinglish only (never Devanagari).${audio ? `\n\nAUDIO (voiceover) for this window:\n${audio}` : ""}
 
 Return ONLY this JSON, nothing else:
 {"real": true or false, "msg": "<refined finding if real, else empty>", "fix": "<fix if real, else empty>"}`,
