@@ -1721,9 +1721,10 @@ function IssueCard({ issue, isSelected, onClick }) {
           <span title={`${issue.confidence} confidence`} style={{
             fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800,
             letterSpacing: "0.06em", textTransform: "uppercase",
-            background: issue.confidence === "high" ? "rgba(239,68,68,0.12)" : issue.confidence === "medium" ? "rgba(245,158,11,0.12)" : "rgba(255,255,255,0.06)",
-            color: issue.confidence === "high" ? T.redLight : issue.confidence === "medium" ? "#fcd34d" : T.textDim,
-            border: `1px solid ${issue.confidence === "high" ? "rgba(239,68,68,0.3)" : issue.confidence === "medium" ? "rgba(245,158,11,0.3)" : T.border}`,
+            background: issue.confidence === "high" ? T.red : issue.confidence === "medium" ? "rgba(245,158,11,0.12)" : "rgba(255,255,255,0.06)",
+            color: issue.confidence === "high" ? "white" : issue.confidence === "medium" ? "#fcd34d" : T.textDim,
+            border: `1px solid ${issue.confidence === "high" ? T.red : issue.confidence === "medium" ? "rgba(245,158,11,0.3)" : T.border}`,
+            boxShadow: issue.confidence === "high" ? "0 1px 6px rgba(220,38,38,0.4)" : "none",
           }}>
             {issue.confidence}
           </span>
