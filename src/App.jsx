@@ -125,6 +125,14 @@ const CHECKS = [
 
 const VALID_CHECK_IDS = new Set(["grammar", "safezone", "quality", "audio", "color", "metadata"]);
 const VALID_SEVERITIES = new Set(["error", "warning", "info"]);
+const VALID_CONFIDENCE = new Set(["high", "medium", "low"]);
+const SEVERITY_RANK = { error: 3, warning: 2, info: 1 };
+// Only HIGH-confidence defects may be shown as "error". Medium caps at "warning",
+// low caps at "info" — graded down, never hidden. Keeps the report trustworthy.
+function gateSeverityByConfidence(severity, confidence) {
+  const cap = confidence === "high" ? "error" : confidence === "medium" ? "warning" : "info";
+  return SEVERITY_RANK[severity] <= SEVERITY_RANK[cap] ? severity : cap;
+}
 
 const T = {
   bg:        "#0a0608",
@@ -305,33 +313,23 @@ async function extractFrames(file, coverageFps = COVERAGE_FPS, onProgress = () =
     }
   }
 
+  // ── DETERMINISTIC capture ───────────────────────────────────────────────────
+  // Label every frame with its FIXED TARGET timestamp (rounded to 2 decimals),
+  // NOT the decoder-snapped video.currentTime. The snapped value drifts slightly
+  // each run (decode timing), which changed the frame set and made the SAME video
+  // produce DIFFERENT findings run-to-run. A fixed grid + fixed labels makes the
+  // frame set identical on every run → far more consistent QC output.
   const frames = [];
-  const seenKeys = new Set();
   for (let i = 0; i < requestedTimestamps.length; i++) {
-    const target = requestedTimestamps[i];
+    const target = Math.max(0, Math.round(requestedTimestamps[i] * 100) / 100);
     onProgress({ phase: "extracting", current: i + 1, total: requestedTimestamps.length });
     try {
       await seekTo(video, target);
-      // small delay to ensure the decoded frame is actually painted
-      await new Promise(r => setTimeout(r, 60));
+      // Wait for the decoded frame to actually paint before grabbing it.
+      await new Promise(r => setTimeout(r, 80));
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      // ── Lock the timestamp ───────────────────────────────────────────────
-      // Read the actual position the canvas drew from (the decoder may snap to
-      // the nearest decodable frame, so video.currentTime can differ slightly
-      // from our request). Keep 2-decimal precision — this is exactly the
-      // position the user will scrub to.
-      const ts = Math.max(0, Math.round(video.currentTime * 100) / 100);
-
-      // Skip duplicates — adjacent dense samples can snap to the same decoded
-      // frame. Dedupe at ~0.2s resolution so we don't send Claude the same
-      // image twice while still keeping genuinely distinct frames.
-      const key = Math.round(ts * 5); // buckets of 0.2s
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-
       const dataUrl = canvas.toDataURL("image/jpeg", FRAME_JPEG_QUALITY);
-      frames.push({ ts, data: dataUrl.split(",")[1] });
+      frames.push({ ts: target, data: dataUrl.split(",")[1] });
     } catch (e) {
       console.warn(`Frame at ${target.toFixed(2)}s failed:`, e.message);
     }
@@ -341,8 +339,6 @@ async function extractFrames(file, coverageFps = COVERAGE_FPS, onProgress = () =
   video.remove();
 
   if (frames.length === 0) throw new Error("Could not extract any frames from video");
-  // Sort by timestamp (skipped-dup logic may have produced out-of-order frames)
-  frames.sort((a, b) => a.ts - b.ts);
   return { frames, duration };
 }
 
@@ -690,6 +686,24 @@ BE CONSERVATIVE — speech-to-text is imperfect and timing can drift:
   • If NO AUDIO TRANSCRIPT is provided, skip this section entirely.
 
 ═══════════════════════════════════════════════════════════════════════════
+HINGLISH PHONETIC CONFUSIONS — CHECK THESE EVERY TIME
+═══════════════════════════════════════════════════════════════════════════
+These near-identical Hinglish pairs change MEANING. Whenever the caption shows
+the LEFT-type form, confirm it against the audio/context — if the right form is
+intended, flag it (kind "audio_mismatch" if the audio confirms it, else
+"spelling"; severity "error" when meaning clearly flips):
+  • mazboor (forced/helpless)   vs  mazboot (strong)
+  • mane (accepted)             vs  maane (meaning / "are considered")
+  • niv / niw                   vs  neev (foundation)
+  • hai (is, singular)          vs  hain (are, plural)
+  • pesa                        vs  paisa (money)
+  • saal (year)                 vs  sahal/sal  (verify intent)
+  • karo                        vs  karoge / karenge (tense/person)
+  • bina (without)              vs  bin / binaa  (verify intent)
+This is a checklist, NOT the limit — any meaning-changing Hinglish homophone
+counts. Apply it identically on every run for consistent results.
+
+═══════════════════════════════════════════════════════════════════════════
 OTHER DEFECTS TO CATCH
 ═══════════════════════════════════════════════════════════════════════════
 1. Spelling — missing/extra/transposed letters, homophones, wrong-word
@@ -841,17 +855,35 @@ before or after. Just the array.
 Each finding is an object with EXACTLY these fields, in this order:
 
 {
-  "frameIndex": <integer copied verbatim from the [FRAME_METADATA] block>,
-  "timestamp":  <integer seconds copied verbatim from the [FRAME_METADATA] block>,
-  "category":   "qc_technical" | "creative_retention",
-  "checkId":    "grammar" | "safezone" | "quality" | "color",
-  "severity":   "error" | "warning" | "info",
-  "msg":        "<specific finding — quote the exact wrong text>",
-  "fix":        "<professional suggestion: exact replacement text plus phrasing/styling improvement>"
+  "frameIndex":  <integer copied verbatim from the [FRAME_METADATA] block>,
+  "timestamp":   <number copied verbatim from the [FRAME_METADATA] block>,
+  "category":    "qc_technical" | "creative_retention",
+  "checkId":     "grammar" | "safezone" | "quality" | "color",
+  "kind":        "audio_mismatch" | "spelling" | "grammar" | "punctuation" | "caps" | "layout" | "truncation" | "consistency" | "creative",
+  "severity":    "error" | "warning" | "info",
+  "confidence":  "high" | "medium" | "low",
+  "captionText": "<exact on-screen text involved, Latin Hinglish>",
+  "audioText":   "<what the voiceover says here, Latin Hinglish; empty if not audio-related>",
+  "msg":         "<one-line headline of the issue>",
+  "why":         "<one short line: why it matters / what meaning changes>",
+  "fix":         "<exact corrected text or concrete action>"
 }
+
+"kind" — classify precisely; this drives downstream handling, so be accurate:
+  • "audio_mismatch" ONLY for a wrong VISIBLE word that contradicts the voiceover.
+  • "truncation" ONLY for a word genuinely cut off that never completes anywhere.
+  • otherwise the matching defect type (spelling / grammar / punctuation / ...).
+
+"confidence" — how sure THIS is a real defect:
+  • "high"   — unmistakable (clear typo, repeated-letter, clear audio mismatch).
+  • "medium" — likely but the image/audio is slightly unclear.
+  • "low"    — possible but uncertain (blurry text, ambiguous audio).
+Reserve "error" severity for HIGH-confidence defects — only those are shown to
+the user as Errors; medium/low are shown at lower severity.
 
 Severity assignment (apply consistently):
   • Repeated-letter typo  → "warning" minimum, "error" preferred
+  • Clear audio mismatch  → "error" (high confidence)
   • Other spelling error  → "warning" minimum
   • Brief deviation (factual mismatch like wrong price/name) → "error"
   • Safe-zone violation   → "error"
@@ -860,13 +892,15 @@ Severity assignment (apply consistently):
   • Style / consistency   → "info" (only when truly stylistic, never wrong)
   • Creative suggestion   → "info" default, "warning" for hook problems
 
-Msg field — quote the exact wrong text from the frame. For spellings,
-format as:  Spelling: "WRONGWORD" → "CORRECTWORD"
-For creative findings, lead with the issue, e.g.:
-  "Hook gap: no on-screen text in frames at 0:00–0:03"
-
-Fix field — professional, actionable: (a) exact replacement or concrete
-suggestion, (b) phrasing/styling improvement or rationale.
+PREMIUM FORMAT — fill EVERY field so each finding reads like this:
+  Timestamp 0:09 · Audio mismatch
+  Caption says:   "mazboor neev hote hain"
+  Voiceover says: "mazboot neev hote hain"
+  Why it matters: meaning flips from "strong foundation" to "forced/helpless".
+  Fix:            replace "mazboor" with "mazboot".
+So: captionText = the exact on-screen text; audioText = what the voiceover says
+(empty for non-audio issues); msg = short headline; why = one line on impact;
+fix = the concrete correction. LATIN HINGLISH ONLY — never Devanagari.
 
 If there are zero findings, return [].
 The array order does not matter — the app sorts by timestamp.
@@ -980,6 +1014,9 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       if (best && bestDiff <= 0.6) ts = best.ts;
     }
 
+    const confidence = VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium";
+    const clean = (v, n) => (typeof v === "string" && v.trim() ? String(v).trim().slice(0, n) : null);
+
     issues.push({
       id: nextId++,
       // This call was run in a single mode (technical batch OR creative pass),
@@ -987,10 +1024,16 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       // placement regardless of how the model labelled the finding.
       category: isCreative ? "creative_retention" : "qc_technical",
       checkId: item.checkId,
-      severity: item.severity,
+      kind: clean(item.kind, 24) || (isCreative ? "creative" : "spelling"),
+      confidence,
+      // Gate severity by confidence so only high-confidence defects read as errors.
+      severity: gateSeverityByConfidence(item.severity, confidence),
       ts,
+      captionText: clean(item.captionText, 300),
+      audioText: clean(item.audioText, 300),
       msg: String(item.msg).slice(0, 400),
-      fix: typeof item.fix === "string" && item.fix.trim() ? String(item.fix).slice(0, 800) : null,
+      why: clean(item.why, 300),
+      fix: clean(item.fix, 800),
     });
   }
 
@@ -1107,14 +1150,26 @@ function dedupeIssues(issues) {
       const bTs = b.ts == null ? Infinity : b.ts;
       [win, lose] = aTs <= bTs ? [a, b] : [b, a];
     }
-    return win.fix ? win : (lose.fix ? { ...win, fix: lose.fix } : win);
+    // Keep the winner's identity but backfill any structured field it lacks
+    // from the discarded duplicate, so no detail is lost on merge.
+    const filled = { ...win };
+    for (const k of ["fix", "why", "audioText", "captionText"]) {
+      if (!filled[k] && lose[k]) filled[k] = lose[k];
+    }
+    return filled;
   };
 
   // One node per finding. Quote-less findings get a synthetic span from their
   // normalized msg so identical-wording dups still merge but distinct ones
   // never collide.
   const nodes = issues.map((it) => {
-    const spans = quotedSpans(`${it.msg} ${it.fix || ""}`);
+    // Prefer the structured captionText as the stable dedup signature; fall back
+    // to quoted spans in the message. This keeps grouping consistent run-to-run.
+    const spans = quotedSpans(`${it.msg} ${it.fix || ""} ${it.captionText || ""}`);
+    if (it.captionText) {
+      const c = it.captionText.toLowerCase().replace(/\s+/g, " ").trim();
+      if (c.length >= 4 || c.includes(" ")) spans.add(c);
+    }
     if (spans.size === 0) {
       spans.add("msg:" + it.msg.toLowerCase().replace(/\s+/g, " ").trim());
     }
@@ -1295,8 +1350,13 @@ async function analyzeSegments(plan, signal, cb = {}) {
 // checked — real typos, audio mismatches, and repeated-letter errors are trusted
 // as-is, so this stays cheap.
 function isAnimationSuspect(it) {
-  const m = (it.msg || "").toLowerCase();
-  return /incomplete|truncat|cut[\s-]?off|mid-?word|cut short|partial|\bfragment\b|does ?n.?t progress|not progress|does ?n.?t show|not shown|missing|full phrase|continue/.test(m);
+  // ONLY genuine truncation/progressive-reveal findings get re-verified against
+  // neighbouring frames. Audio mismatches and spelling errors (which may contain
+  // words like "missing" or "incomplete") must NEVER be routed here — that was
+  // silently dropping real errors like "maane → mane (missing the second a)".
+  if (it.kind) return it.kind === "truncation";
+  const m = (it.msg || "").toLowerCase();   // legacy fallback when kind is absent
+  return /truncat|cut[\s-]?off|mid-?word|does ?n.?t progress|not shown in any|incomplete caption/.test(m);
 }
 
 async function verifyFinding(it, frames, transcript, signal, opts = {}) {
@@ -1642,14 +1702,46 @@ function IssueCard({ issue, isSelected, onClick }) {
             {s.label}
           </span>
         )}
+        {!isCreative && issue.confidence && (
+          <span title={`${issue.confidence} confidence`} style={{
+            fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800,
+            letterSpacing: "0.06em", textTransform: "uppercase",
+            background: issue.confidence === "high" ? "rgba(239,68,68,0.12)" : issue.confidence === "medium" ? "rgba(245,158,11,0.12)" : "rgba(255,255,255,0.06)",
+            color: issue.confidence === "high" ? T.redLight : issue.confidence === "medium" ? "#fcd34d" : T.textDim,
+            border: `1px solid ${issue.confidence === "high" ? "rgba(239,68,68,0.3)" : issue.confidence === "medium" ? "rgba(245,158,11,0.3)" : T.border}`,
+          }}>
+            {issue.confidence}
+          </span>
+        )}
         <span style={{ fontSize: 11, color: T.textDim, marginLeft: "auto" }}>
           {check?.icon} {check?.label}
         </span>
       </div>
-      <p style={{ fontSize: 13, color: "white", lineHeight: 1.45, fontWeight: 500 }}>{issue.msg}</p>
-      {issue.fix && (
-        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>{issue.fix}</p>
-      )}
+      <p style={{ fontSize: 13, color: "white", lineHeight: 1.45, fontWeight: 600 }}>{issue.msg}</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6 }}>
+        {issue.captionText && (
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, margin: 0 }}>
+            <span style={{ color: T.textDim }}>Caption: </span>
+            <span style={{ color: "rgba(255,255,255,0.85)" }}>“{issue.captionText}”</span>
+          </p>
+        )}
+        {issue.audioText && (
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, margin: 0 }}>
+            <span style={{ color: T.textDim }}>🎙 Voiceover: </span>
+            <span style={{ color: "rgba(255,255,255,0.85)" }}>“{issue.audioText}”</span>
+          </p>
+        )}
+        {issue.why && (
+          <p style={{ fontSize: 11, lineHeight: 1.5, margin: 0, color: T.textMute }}>
+            <span style={{ color: T.textDim }}>Why: </span>{issue.why}
+          </p>
+        )}
+        {issue.fix && (
+          <p style={{ fontSize: 11, lineHeight: 1.5, margin: 0, color: T.redLight }}>
+            <span style={{ color: T.textDim }}>Fix: </span>{issue.fix}
+          </p>
+        )}
+      </div>
     </div>
   );
 }
