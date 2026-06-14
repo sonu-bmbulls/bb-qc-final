@@ -102,6 +102,11 @@ const STT_MODEL = "scribe_v1";    // ElevenLabs Scribe batch model (90+ language
 const AUDIO_SAMPLE_RATE = 16000;  // mono 16kHz is plenty for ASR and keeps WAV small
 const AUDIO_CHUNK_SEC = 90;       // 90s mono-16k WAV ≈ 2.9MB, under Vercel's 4.5MB body cap
 
+// ── Animation verification ────────────────────────────────────────────────────
+const VERIFY_WINDOW_SEC = 1.5;    // ± seconds of neighbouring frames used to confirm
+                                  // whether a "truncated/incomplete" finding is just a
+                                  // caption still animating in (then it's dropped)
+
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
 // Per-mode $/1M pricing lives on each MODE above.
@@ -721,10 +726,12 @@ DO NOT FLAG
   complete clause". Only flag a defect that is WRONG INSIDE THE VISIBLE TEXT
   ITSELF: a misspelling, a repeated-letter typo, a wrong/near-homophone word,
   broken punctuation inside an otherwise-complete line, or a safe-zone/layout
-  problem. If the only thing "wrong" is that the phrase or a word is cut short /
-  truncated mid-word (e.g. "econo" for "economy"), say NOTHING — UNLESS the
-  AUDIO clearly speaks the full word, in which case report it as an AUDIO
-  MISMATCH, never as an "incomplete caption" or "cut off mid-word".
+  problem. A word that looks truncated mid-word (e.g. "econo" for "economy") is
+  usually mid-ANIMATION: FIRST check the adjacent frames you were given — if the
+  word completes in a nearby frame, it is an animation reveal, so say NOTHING.
+  Only flag a truncated word if it does NOT complete in any frame you can see,
+  or the AUDIO clearly speaks the full word (then report it as an AUDIO
+  MISMATCH). Never flag a pure sentence fragment or standalone word, regardless.
 
 ═══════════════════════════════════════════════════════════════════════════
 TWO CATEGORIES OF FINDING — KEEP THEM SEPARATE
@@ -1265,6 +1272,87 @@ async function analyzeSegments(plan, signal, cb = {}) {
   }
 
   return reducePlan(plan);
+}
+
+// ── ANIMATION VERIFICATION PASS ───────────────────────────────────────────────
+// Kinetic captions reveal text over several frames, so a single frame can catch
+// a word mid-animation ("econo" before "economy" finishes). The main pass can
+// flag that as a truncation. Before trusting such a finding, we re-examine the
+// CONSECUTIVE frames around its timestamp: if the word completes in a nearby
+// frame, it was just animating → drop it. If it never completes (or the audio
+// says the full word), keep it. Only truncation/incompleteness-type findings are
+// checked — real typos, audio mismatches, and repeated-letter errors are trusted
+// as-is, so this stays cheap.
+function isAnimationSuspect(it) {
+  const m = (it.msg || "").toLowerCase();
+  return /incomplete|truncat|cut[\s-]?off|mid-?word|cut short|partial word|\bfragment\b/.test(m);
+}
+
+async function verifyFinding(it, frames, transcript, signal, opts = {}) {
+  const model = opts.model || DEFAULT_MODEL;
+  const ts = it.ts ?? 0;
+  const lo = ts - VERIFY_WINDOW_SEC, hi = ts + VERIFY_WINDOW_SEC;
+  const window = frames.filter((f) => f.ts >= lo && f.ts <= hi);
+  if (window.length < 2) return { real: true };   // not enough context to refute → keep
+
+  const audio = transcript ? transcriptWindow(transcript, lo, hi) : "";
+  const content = [{
+    type: "text",
+    text: `These ${window.length} frames are CONSECUTIVE, spanning a ~${VERIFY_WINDOW_SEC * 2}s window of a video whose on-screen captions animate IN one word/phrase at a time. A previous QC pass flagged this at ${fmtTs(ts)}:
+
+FLAGGED: ${it.msg}
+
+The caption's TRUE text is its MOST COMPLETE state across these frames. A word that looks cut short in an early frame but COMPLETES in a later frame is an ANIMATION REVEAL — in that case the finding is NOT real. Output Latin-script Hinglish only (never Devanagari).${audio ? `\n\nAUDIO (voiceover) for this window:\n${audio}` : ""}
+
+Return ONLY this JSON, nothing else:
+{"real": true or false, "msg": "<refined finding if real, else empty>", "fix": "<fix if real, else empty>"}`,
+  }];
+  window.forEach((f, i) => {
+    content.push({ type: "text", text: `[FRAME ${i}] timestamp=${f.ts}` });
+    content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f.data } });
+  });
+
+  try {
+    const res = await postMessages({ model, max_tokens: 400, temperature: 0, messages: [{ role: "user", content }] }, signal);
+    if (!res.ok) return { real: true };
+    const data = await res.json();
+    const text = (data?.content?.map((b) => b.text || "").join("") || "").trim();
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return { real: true };
+    const v = JSON.parse(m[0]);
+    return { real: !!v.real, msg: v.msg, fix: v.fix };
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    return { real: true };   // verification failed → keep (never silently lose a real error)
+  }
+}
+
+// Verify every animation-suspect finding (in parallel), drop the ones that turn
+// out to be mid-animation reveals, refine the ones that are real, renumber ids.
+async function verifyAnimationSuspects(issues, plan, signal, onProgress = () => {}) {
+  const model = (MODES[plan.modeId] || MODES[DEFAULT_MODE]).model;
+  const suspects = issues.filter(isAnimationSuspect);
+  if (suspects.length === 0) return issues;
+
+  const verdicts = new Map();
+  let done = 0;
+  const tasks = suspects.map((it) => async () => {
+    if (signal?.aborted) return;
+    const v = await verifyFinding(it, plan.frames, plan.transcript, signal, { model }).catch(() => ({ real: true }));
+    verdicts.set(it.id, v);
+    onProgress({ current: ++done, total: suspects.length });
+  });
+  await runWithConcurrency(tasks, 6);
+
+  const out = [];
+  for (const it of issues) {
+    const v = verdicts.get(it.id);
+    if (!v) { out.push(it); continue; }          // not a suspect → keep as-is
+    if (!v.real) continue;                        // animation reveal → drop
+    out.push(v.msg ? { ...it, msg: v.msg, fix: v.fix || it.fix } : it);
+  }
+  out.forEach((x, i) => { x.id = i + 1; });
+  return out;
 }
 
 // Estimate frames, API calls, tokens, and dollars for THIS mode's scan — shown
@@ -2349,7 +2437,11 @@ export default function App() {
       if (controller.signal.aborted) return;
 
       setAnalysisPhase("finalizing");
-      setIssues(sortByTs(result.issues));
+      // Verify animation-suspect findings against neighbouring frames — drop the
+      // ones that were just captions still animating in (e.g. "econo"→"economy").
+      const finalIssues = await verifyAnimationSuspects(result.issues, plan, controller.signal, (p) => setAnalysisProgress(p));
+      if (controller.signal.aborted) return;
+      setIssues(sortByTs(finalIssues));
       finishRun(result);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
@@ -2388,7 +2480,11 @@ export default function App() {
       });
       if (controller.signal.aborted) return;
       setAnalysisPhase("finalizing");
-      setIssues(sortByTs(result.issues));
+      // Verify animation-suspect findings against neighbouring frames — drop the
+      // ones that were just captions still animating in (e.g. "econo"→"economy").
+      const finalIssues = await verifyAnimationSuspects(result.issues, plan, controller.signal, (p) => setAnalysisProgress(p));
+      if (controller.signal.aborted) return;
+      setIssues(sortByTs(finalIssues));
       finishRun(result);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
