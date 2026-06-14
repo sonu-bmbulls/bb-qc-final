@@ -23,6 +23,8 @@ export default defineConfig(({ mode }) => {
     apiKey = apiKey.replace(/[\u200B-\u200D\uFEFF]/g, '');
   }
 
+  const elevenKey = (env.ELEVENLABS_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+
   const keyLooksValid = !!apiKey && apiKey.startsWith('sk-ant-') && apiKey.length >= 40;
   const charsTrimmed = rawLength - (apiKey?.length ?? 0);
 
@@ -52,6 +54,9 @@ export default defineConfig(({ mode }) => {
     console.log('│       startup                                                      │');
   }
   console.log('└────────────────────────────────────────────────────────────────────┘\n');
+  console.log(elevenKey
+    ? '  ✓ ELEVENLABS_API_KEY loaded — audio speech-to-text cross-check enabled\n'
+    : '  ⚠ ELEVENLABS_API_KEY missing — audio cross-check will be skipped\n');
 
   return {
     plugins: [react()],
@@ -59,6 +64,32 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       open: true,
       proxy: {
+        // ── ElevenLabs Scribe (speech-to-text) ────────────────────────────────
+        // Forwards multipart audio to api.elevenlabs.io and injects xi-api-key.
+        // Mirrors the production fn at api/elevenlabs/v1/speech-to-text.js.
+        '/api/elevenlabs': {
+          target: 'https://api.elevenlabs.io',
+          changeOrigin: true,
+          secure: true,
+          rewrite: (p) => p.replace(/^\/api\/elevenlabs/, ''),
+          timeout: 180000,
+          proxyTimeout: 180000,
+          configure: (proxy) => {
+            proxy.on('proxyReq', (proxyReq) => {
+              proxyReq.removeHeader('origin');
+              proxyReq.removeHeader('referer');
+              proxyReq.removeHeader('cookie');
+              if (elevenKey) proxyReq.setHeader('xi-api-key', elevenKey);
+            });
+            proxy.on('error', (err, _req, res) => {
+              console.error('\n[eleven proxy] network error:', err.message);
+              if (res && !res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'ElevenLabs proxy error: ' + err.message } }));
+              }
+            });
+          },
+        },
         '/api/anthropic': {
           target: 'https://api.anthropic.com',
           changeOrigin: true,

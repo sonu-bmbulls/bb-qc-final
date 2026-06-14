@@ -96,6 +96,12 @@ const CREATIVE_FRAME_COUNT = 12; // sparse, evenly-spaced frames for the holisti
 const MAX_FRAME_WIDTH = 1600;    // px; higher = clearer OCR. Small batches keep payloads safe
 const FRAME_JPEG_QUALITY = 0.85; // higher = better OCR on small/stylized text
 
+// ── Audio / speech-to-text (ElevenLabs Scribe) ────────────────────────────────
+const STT_URL = "/api/elevenlabs/v1/speech-to-text";
+const STT_MODEL = "scribe_v1";    // ElevenLabs Scribe batch model (90+ languages incl. Hindi)
+const AUDIO_SAMPLE_RATE = 16000;  // mono 16kHz is plenty for ASR and keeps WAV small
+const AUDIO_CHUNK_SEC = 90;       // 90s mono-16k WAV ≈ 2.9MB, under Vercel's 4.5MB body cap
+
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
 // Per-mode $/1M pricing lives on each MODE above.
@@ -334,6 +340,114 @@ async function extractFrames(file, coverageFps = COVERAGE_FPS, onProgress = () =
   return { frames, duration };
 }
 
+// ── AUDIO → SPEECH-TO-TEXT (ElevenLabs Scribe) ───────────────────────────────
+// Decode the file's audio to mono 16kHz in the browser, chunk it (Vercel 4.5MB
+// body cap), and transcribe each chunk through the /api/elevenlabs proxy.
+// Returns { text, words:[{text,start}] } with ABSOLUTE timestamps, or null if the
+// file has no decodable audio track (we then just skip the audio cross-check).
+async function decodeToMono(file, targetRate) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  const arrayBuf = await file.arrayBuffer();
+  const tmp = new AC();
+  let decoded;
+  try { decoded = await tmp.decodeAudioData(arrayBuf.slice(0)); }
+  finally { try { tmp.close(); } catch { /* ignore */ } }
+  const length = Math.max(1, Math.ceil(decoded.duration * targetRate));
+  const offline = new OfflineAudioContext(1, length, targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start(0);
+  return offline.startRendering();   // mono AudioBuffer @ targetRate
+}
+
+// Encode a Float32 sample array as a 16-bit PCM mono WAV Blob.
+function encodeWavMono(samples, sampleRate) {
+  const dataSize = samples.length * 2;
+  const ab = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(ab);
+  const ws = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); view.setUint32(4, 36 + dataSize, true); ws(8, "WAVE"); ws(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); ws(36, "data");
+  view.setUint32(40, dataSize, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    off += 2;
+  }
+  return new Blob([ab], { type: "audio/wav" });
+}
+
+async function transcribeAudio(file, signal, onProgress = () => {}) {
+  let rendered;
+  try { rendered = await decodeToMono(file, AUDIO_SAMPLE_RATE); }
+  catch (e) { console.warn("[BB QC] audio decode failed (skipping STT):", e.message); return null; }
+  if (!rendered) return null;
+
+  const sr = AUDIO_SAMPLE_RATE;
+  const all = rendered.getChannelData(0);
+  const chunkLen = AUDIO_CHUNK_SEC * sr;
+  const nChunks = Math.max(1, Math.ceil(all.length / chunkLen));
+  const words = [];
+  let fullText = "";
+
+  for (let c = 0; c < nChunks; c++) {
+    if (signal?.aborted) break;
+    const start = c * chunkLen;
+    const slice = all.subarray(start, Math.min(all.length, start + chunkLen));
+    const offsetSec = start / sr;
+    const wav = encodeWavMono(slice, sr);
+
+    const fd = new FormData();
+    fd.append("model_id", STT_MODEL);
+    fd.append("file", wav, `audio_${c}.wav`);
+    try {
+      const res = await fetch(STT_URL, { method: "POST", body: fd, signal });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        console.warn(`[BB QC] STT chunk ${c} failed ${res.status}: ${t.slice(0, 160)}`);
+        continue;
+      }
+      const data = await res.json();
+      if (data.text) fullText += (fullText ? " " : "") + data.text;
+      for (const w of data.words || []) {
+        if (w.type && w.type !== "word") continue;
+        if (typeof w.text !== "string" || !w.text.trim()) continue;
+        words.push({ text: w.text, start: (Number(w.start) || 0) + offsetSec });
+      }
+    } catch (e) {
+      if (e.name === "AbortError") break;
+      console.warn(`[BB QC] STT chunk ${c} error:`, e.message);
+    }
+    onProgress({ current: c + 1, total: nChunks });
+  }
+
+  if (!fullText && words.length === 0) return null;
+  return { text: fullText.trim(), words };
+}
+
+// Build a compact, timestamped transcript string for the prompt, limited to the
+// [loTs, hiTs] window (± 1s slack) so each batch only sees the audio overlapping
+// its frames. Lines look like: "[m:ss] word word word…".
+function transcriptWindow(transcript, loTs, hiTs) {
+  if (!transcript) return "";
+  const lo = loTs - 1, hi = hiTs + 1;
+  const ws = (transcript.words || []).filter((w) => w.start >= lo && w.start <= hi);
+  if (ws.length === 0) {
+    return transcript.text && transcript.text.length < 600 ? transcript.text : "";
+  }
+  const lines = [];
+  for (let i = 0; i < ws.length; i += 10) {
+    const group = ws.slice(i, i + 10);
+    lines.push(`[${fmtTs(group[0].start)}] ${group.map((w) => w.text).join(" ")}`);
+  }
+  return lines.join("\n");
+}
+
 /**
  * Send extracted frames to Claude with the strict QC prompt.
  *
@@ -406,6 +520,10 @@ async function analyzeFrames(frames, duration, signal, referenceBrief = "", pass
   const briefClean = (referenceBrief || "").trim();
   const hasBrief = briefClean.length > 0;
   const isCreative = pass === "creative";
+  const transcript = opts.transcript || null;
+  const loTs = frames[0]?.ts ?? 0;
+  const hiTs = frames[frames.length - 1]?.ts ?? loTs;
+  const audioText = (!isCreative && transcript) ? transcriptWindow(transcript, loTs, hiTs) : "";
 
   // ── PASS DIRECTIVE ──────────────────────────────────────────────────────────
   // VOLATILE — tells the model which job THIS call is doing. Lives in the USER
@@ -454,7 +572,16 @@ qc_technical. In the "fix" field, explicitly reference the user's instruction.
 THE USER'S INSTRUCTIONS (authoritative for this video):
 <user_instructions>
 ${briefClean}
-</user_instructions>` : ""}`,
+</user_instructions>` : ""}${audioText ? `
+
+═══════════════════════════════════════════════════════════════════════════
+AUDIO TRANSCRIPT (voiceover — speech-to-text, THIS time window)
+═══════════════════════════════════════════════════════════════════════════
+What the VOICEOVER actually says, time-aligned. It may be Hindi (Devanagari) or
+romanized and may contain minor ASR errors. Use it ONLY for the AUDIO vs
+ON-SCREEN TEXT cross-check described in the rules.
+
+${audioText}` : ""}`,
   });
 
   // ── STATIC instruction block (cached) ───────────────────────────────────────
@@ -508,6 +635,31 @@ exceptions for style, no exceptions for language. Flag every single one.
 
 Minimum severity for repeated-letter typos: "warning". Use "error" when
 the intended word is unambiguous.
+
+═══════════════════════════════════════════════════════════════════════════
+AUDIO vs ON-SCREEN TEXT CROSS-CHECK
+═══════════════════════════════════════════════════════════════════════════
+When the user message includes an AUDIO TRANSCRIPT, it is what the voiceover
+actually says (speech-to-text, time-aligned). Use it to catch captions that
+contradict the spoken word.
+
+STEP 1 — NORMALIZE: the transcript may be in Hindi (Devanagari) or romanized,
+while the on-screen captions are usually romanized Hinglish (or English).
+Mentally transliterate the transcript into the SAME script/register as the
+caption so the two are comparable (e.g. "मज़बूत" ≈ "mazboot", "नींव" ≈ "neev").
+
+STEP 2 — COMPARE each caption against the time-aligned audio. Flag a finding
+ONLY when a caption word is a REAL but WRONG word that does not match what the
+audio says AND the difference changes meaning. The classic case:
+  • audio says "mazboot" (strong) but the caption reads "mazboor" (forced) →
+    "error". msg format: Audio mismatch: caption "mazboor" but voiceover says
+    "mazboot" → "mazboot". Use checkId "grammar", severity "error".
+
+BE CONSERVATIVE — speech-to-text is imperfect and timing can drift:
+  • Do NOT flag normal Hinglish spelling variants, filler words, or rephrasings
+    that don't change meaning.
+  • Do NOT flag when the audio is unclear or simply worded differently.
+  • If NO AUDIO TRANSCRIPT is provided, skip this section entirely.
 
 ═══════════════════════════════════════════════════════════════════════════
 OTHER DEFECTS TO CATCH
@@ -1060,7 +1212,7 @@ async function analyzeSegments(plan, signal, cb = {}) {
     if (seg.ac.signal.aborted) { seg.remaining = Math.max(0, seg.remaining - 1); finalizeSeg(seg); return; }
     try {
       const r = await analyzeFrames(batch, duration, seg.ac.signal, brief, "technical",
-        { model: mode.model, maxTokens: mode.maxTokens });
+        { model: mode.model, maxTokens: mode.maxTokens, transcript: plan.transcript });
       seg.collected.push(...r.issues);
     } catch (e) {
       if (e.name !== "AbortError") { seg.hadError = true; console.error("[BB QC] batch failed:", e.message); }
@@ -2139,9 +2291,14 @@ export default function App() {
     try {
       setAnalysisPhase("extracting");
       setAnalysisProgress({ current: 0, total: 1 });
-      const { frames, duration } = await extractFrames(f, cfg.coverageFps, (p) => {
-        setAnalysisProgress({ current: p.current, total: p.total });
-      });
+      // Extract frames AND transcribe the voiceover in parallel (both read the
+      // file). Transcription is non-fatal — if there's no audio track or STT
+      // fails, transcript is null and the audio cross-check is simply skipped.
+      const [framesResult, transcript] = await Promise.all([
+        extractFrames(f, cfg.coverageFps, (p) => setAnalysisProgress({ current: p.current, total: p.total })),
+        transcribeAudio(f, controller.signal).catch((e) => { console.warn("[BB QC] transcription skipped:", e.message); return null; }),
+      ]);
+      const { frames, duration } = framesResult;
       setVideoDuration(duration);
       if (controller.signal.aborted) return;
 
@@ -2154,6 +2311,7 @@ export default function App() {
         frames,
         duration,
         brief: briefForThisRun,
+        transcript,
         segments: segFrames.map((fr, i) => ({ id: i, frames: fr, status: "pending", issues: [] })),
         creativeDone: false,
         creativeIssues: [],
