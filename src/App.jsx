@@ -234,6 +234,84 @@ function sortByTs(list) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// LOCAL WORKSPACE — per-user login (localStorage) + scan history (IndexedDB)
+// No backend: the current user's name lives in localStorage; each scan (metadata
+// + findings + the video blob) is stored in IndexedDB so reports reopen WITH
+// playback. Everything older than 7 days is purged. History is per-browser.
+// ═════════════════════════════════════════════════════════════════════════════
+const USER_KEY = "bbqc_user";
+const IDB_NAME = "bbqc";
+const IDB_STORE = "scans";
+const SCAN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // reports kept for 7 days
+
+function loadUser() { try { return localStorage.getItem(USER_KEY) || ""; } catch { return ""; } }
+function storeUser(name) { try { localStorage.setItem(USER_KEY, name); } catch { /* ignore */ } }
+function clearStoredUser() { try { localStorage.removeItem(USER_KEY); } catch { /* ignore */ } }
+
+function fmtDate(ms) {
+  try { return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); }
+  catch { return "—"; }
+}
+function fmtClock(ms) {
+  try { return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }); }
+  catch { return "—"; }
+}
+function daysLeft(ms) {
+  return Math.max(0, Math.ceil((ms + SCAN_RETENTION_MS - Date.now()) / (24 * 60 * 60 * 1000)));
+}
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        const os = db.createObjectStore(IDB_STORE, { keyPath: "id" });
+        os.createIndex("user", "user", { unique: false });
+        os.createIndex("createdAt", "createdAt", { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbTx(mode, fn) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, mode);
+    const store = tx.objectStore(IDB_STORE);
+    let out;
+    const r = fn(store);
+    if (r) r.onsuccess = () => { out = r.result; };
+    tx.oncomplete = () => { db.close(); resolve(out); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  }));
+}
+const idbGetAll = () => idbTx("readonly", (s) => s.getAll());
+const idbGet = (id) => idbTx("readonly", (s) => s.get(id));
+const idbDelete = (id) => idbTx("readwrite", (s) => s.delete(id));
+
+async function saveScan(rec) {
+  try { await idbTx("readwrite", (s) => s.put(rec)); return true; }
+  catch (e) {
+    // Quota exceeded (big video blob) → retry report-only so history still works.
+    if (rec.blob) { try { await idbTx("readwrite", (s) => s.put({ ...rec, blob: null })); return true; } catch { /* */ } }
+    console.warn("[BB QC] could not save scan:", e?.message);
+    return false;
+  }
+}
+
+// List a user's scans (newest first) and purge anything past the 7-day window.
+async function listUserScans(user) {
+  let all = [];
+  try { all = await idbGetAll(); } catch { return []; }
+  const cutoff = Date.now() - SCAN_RETENTION_MS;
+  for (const r of all) if (r.createdAt < cutoff) { try { await idbDelete(r.id); } catch { /* */ } }
+  return all
+    .filter((r) => r.createdAt >= cutoff && r.user === user)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 3. ANALYSIS PIPELINE
 //
 // This section was previously in src/videoAnalysis.js. Inlined here to keep
@@ -1762,7 +1840,7 @@ function IssueCard({ issue, isSelected, onClick }) {
   );
 }
 
-function Nav({ apiStatus }) {
+function Nav({ apiStatus, user, onLogout }) {
   const dotColor = !apiStatus.probed ? "#94a3b8" : apiStatus.ok ? "#10b981" : T.redBright;
   const dotLabel = !apiStatus.probed ? "Checking API…" : apiStatus.ok ? "API connected" : "API unavailable";
   return (
@@ -1775,9 +1853,18 @@ function Nav({ apiStatus }) {
             <span style={{ fontSize: 10, color: T.textDim, letterSpacing: "0.04em" }}>Video Quality Control</span>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 12px", borderRadius: 20, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}` }} title={apiStatus.detail || ""}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, boxShadow: `0 0 8px ${dotColor}` }} />
-          <span style={{ fontSize: 12, color: T.textMute }}>{dotLabel}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 12px", borderRadius: 20, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}` }} title={apiStatus.detail || ""}>
+            <div style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, boxShadow: `0 0 8px ${dotColor}` }} />
+            <span style={{ fontSize: 12, color: T.textMute }}>{dotLabel}</span>
+          </div>
+          {user && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div title={user} style={{ width: 30, height: 30, borderRadius: "50%", background: T.gradientPurple, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, textTransform: "uppercase" }}>{user.slice(0, 1)}</div>
+              <span style={{ fontSize: 13, color: "white", fontWeight: 600, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user}</span>
+              <button onClick={onLogout} title="Log out" style={{ fontSize: 11, color: T.textDim, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, borderRadius: 8, padding: "5px 10px", cursor: "pointer" }}>Log out</button>
+            </div>
+          )}
         </div>
       </div>
     </nav>
@@ -2213,7 +2300,7 @@ function ResultsStage(props) {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={onNewUpload} style={{ padding: "9px 18px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
-            ↩ New Upload
+            ← Dashboard
           </button>
           <button style={{ padding: "9px 18px", borderRadius: 9, background: T.gradient, color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 8px rgba(220,38,38,0.3)" }}>
             ⬇ Export PDF
@@ -2433,11 +2520,146 @@ function ResultsStage(props) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 4b. WORKSPACE UI — login + dashboard
+// ═════════════════════════════════════════════════════════════════════════════
+
+function LoginStage({ onLogin }) {
+  const [name, setName] = useState("");
+  const submit = () => { const n = name.trim(); if (n) onLogin(n); };
+  return (
+    <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)" }}>
+      <div style={{ width: "100%", maxWidth: 420, textAlign: "center" }}>
+        <div style={{ width: 54, height: 54, borderRadius: 14, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, margin: "0 auto 20px", boxShadow: "0 6px 18px rgba(220,38,38,0.35)" }}>BB</div>
+        <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.02em" }}>Welcome to BB QC Studio</h1>
+        <p style={{ color: T.textDim, marginTop: 10, fontSize: 14, lineHeight: 1.5 }}>Enter your name to open your QC workspace. Your scans are saved here for 7 days.</p>
+        <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 12 }}>
+          <input
+            autoFocus value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+            placeholder="Your name (e.g. Akshay)"
+            style={{ padding: "14px 16px", borderRadius: 12, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, color: "white", fontSize: 15, outline: "none", textAlign: "center", boxSizing: "border-box" }}
+          />
+          <button onClick={submit} disabled={!name.trim()}
+            style={{ padding: "14px 16px", borderRadius: 12, border: "none", cursor: name.trim() ? "pointer" : "not-allowed", background: name.trim() ? T.gradient : "rgba(255,255,255,0.06)", color: "white", fontSize: 15, fontWeight: 800, boxShadow: name.trim() ? "0 4px 14px rgba(220,38,38,0.35)" : "none" }}>
+            Enter workspace →
+          </button>
+        </div>
+        <p style={{ color: T.textMute, fontSize: 11, marginTop: 16, lineHeight: 1.5 }}>No password needed for now. History is stored privately in this browser.</p>
+      </div>
+    </div>
+  );
+}
+
+function StatusPill({ errors, incomplete }) {
+  const label = incomplete ? "Incomplete" : errors > 0 ? "Needs fixes" : "Clean";
+  const color = incomplete ? "#f59e0b" : errors > 0 ? T.redBright : "#10b981";
+  return <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.04em", padding: "3px 9px", borderRadius: 20, color, background: `${color}1a`, border: `1px solid ${color}55` }}>{label.toUpperCase()}</span>;
+}
+
+function ScanCard({ rec, onOpen }) {
+  return (
+    <div
+      onClick={() => onOpen(rec.id)}
+      onMouseEnter={(e) => { e.currentTarget.style.borderColor = T.borderHot; }}
+      onMouseLeave={(e) => { e.currentTarget.style.borderColor = T.border; }}
+      style={{ cursor: "pointer", background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", gap: 10, transition: "all 0.15s" }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <ScoreRing score={rec.score} size={46} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{ fontSize: 13, fontWeight: 700, color: "white", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>🎬 {rec.fileName}</p>
+          <p style={{ fontSize: 11, color: T.textDim, marginTop: 2, fontFamily: "DM Mono, monospace" }}>{fmtDate(rec.createdAt)} · {fmtClock(rec.createdAt)}</p>
+        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 11, color: T.redLight, fontWeight: 700 }}>{rec.errors} err</span>
+        <span style={{ fontSize: 11, color: "#fcd34d", fontWeight: 700 }}>{rec.warnings} warn</span>
+        <StatusPill errors={rec.errors} />
+        <span style={{ marginLeft: "auto", fontSize: 10, color: T.textDim }}>⏳ {daysLeft(rec.createdAt)}d left</span>
+      </div>
+    </div>
+  );
+}
+
+function DashboardStage({ user, scans, loading, onNewScan, onOpen, onDelete }) {
+  const recent = scans.slice(0, 6);
+  return (
+    <div className="fade-in" style={{ paddingTop: 8, paddingBottom: 48 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: 28 }}>
+        <div>
+          <h1 style={{ fontSize: 28, fontWeight: 800, letterSpacing: "-0.02em" }}>Your QC Workspace</h1>
+          <p style={{ color: T.textDim, fontSize: 14, marginTop: 4 }}>Signed in as <strong style={{ color: "white" }}>{user}</strong> · reports kept for 7 days</p>
+        </div>
+        <button onClick={onNewScan} style={{ padding: "13px 24px", borderRadius: 12, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 14, fontWeight: 800, boxShadow: "0 4px 14px rgba(220,38,38,0.35)" }}>＋ New QC Scan</button>
+      </div>
+
+      {loading ? (
+        <p style={{ color: T.textDim }}>Loading your workspace…</p>
+      ) : scans.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "64px 20px", border: `1px dashed ${T.border}`, borderRadius: 16, background: "rgba(255,255,255,0.015)" }}>
+          <div style={{ fontSize: 42, marginBottom: 12 }}>🎬</div>
+          <p style={{ fontSize: 16, fontWeight: 700 }}>No scans yet</p>
+          <p style={{ color: T.textDim, fontSize: 13, marginTop: 6 }}>Upload your first video to start your QC history.</p>
+          <button onClick={onNewScan} style={{ marginTop: 18, padding: "11px 22px", borderRadius: 10, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontWeight: 700, fontSize: 13 }}>Start a scan</button>
+        </div>
+      ) : (
+        <>
+          <div style={{ marginBottom: 32 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: "0.04em", textTransform: "uppercase", color: T.textMute, marginBottom: 14 }}>Recent Activity</h2>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 14 }}>
+              {recent.map((r) => <ScanCard key={r.id} rec={r} onOpen={onOpen} />)}
+            </div>
+          </div>
+
+          <div>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: "0.04em", textTransform: "uppercase", color: T.textMute, marginBottom: 14 }}>History</h2>
+            <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 720 }}>
+                  <thead>
+                    <tr style={{ color: T.textDim, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                      {["Video", "Date", "Time", "Score", "Errors", "Warnings", "Status", ""].map((h, i) => (
+                        <th key={i} style={{ textAlign: i === 0 ? "left" : "center", padding: "12px 14px", borderBottom: `1px solid ${T.border}`, fontWeight: 700, whiteSpace: "nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scans.map((r) => (
+                      <tr key={r.id} style={{ borderBottom: `1px solid ${T.border}` }}>
+                        <td style={{ padding: "12px 14px", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>🎬 {r.fileName}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtDate(r.createdAt)}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtClock(r.createdAt)}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", fontWeight: 800, fontFamily: "DM Mono, monospace", color: r.score >= 80 ? "#10b981" : r.score >= 60 ? "#f59e0b" : T.redBright }}>{r.score}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", color: T.redLight, fontWeight: 700 }}>{r.errors}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{r.warnings}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "center" }}><StatusPill errors={r.errors} /></td>
+                        <td style={{ padding: "12px 14px", textAlign: "center", whiteSpace: "nowrap" }}>
+                          <button onClick={() => onOpen(r.id)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 11, fontWeight: 700 }}>Open</button>
+                          <button onClick={() => onDelete(r.id)} title="Delete" style={{ marginLeft: 6, padding: "6px 10px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.05)", color: T.textDim, fontSize: 11, border: `1px solid ${T.border}` }}>✕</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 5. MAIN APP
 // ═════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
-  const [stage, setStage] = useState("upload"); // upload | confirm | analyzing | results
+  const [user, setUser] = useState(loadUser);   // "" until logged in
+  const [stage, setStage] = useState(() => (loadUser() ? "dashboard" : "login")); // login | dashboard | upload | confirm | analyzing | results
+  const [scans, setScans] = useState([]);       // this user's saved reports (IndexedDB)
+  const [dashLoading, setDashLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [file, setFile] = useState(null);
   const [analysisPhase, setAnalysisPhase] = useState("");
@@ -2464,6 +2686,7 @@ export default function App() {
   const abortRef = useRef(null);
   const seekFromExternal = useRef(false);
   const checkpointRef = useRef(null);                      // the resumable scan plan (in memory)
+  const currentScanIdRef = useRef(null);                   // id of the report being written (so resume updates it)
 
   const videoUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
   useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
@@ -2484,6 +2707,86 @@ export default function App() {
   }, [currentTs]);
 
   useEffect(() => () => { abortRef.current?.abort(); }, []);
+
+  // ── Workspace: login + per-user scan history ────────────────────────────────
+  const refreshScans = useCallback(async (who) => {
+    const u = who ?? user;
+    if (!u) { setScans([]); return; }
+    setDashLoading(true);
+    try { setScans(await listUserScans(u)); } finally { setDashLoading(false); }
+  }, [user]);
+
+  useEffect(() => { if (user) refreshScans(user); /* load history on mount */ }, []); // eslint-disable-line
+
+  const handleLogin = useCallback((name) => {
+    storeUser(name); setUser(name); setStage("dashboard"); refreshScans(name);
+  }, [refreshScans]);
+
+  const handleLogout = useCallback(() => {
+    abortRef.current?.abort();
+    clearStoredUser(); setUser(""); setScans([]); setStage("login");
+    setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
+    setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
+    checkpointRef.current = null; currentScanIdRef.current = null;
+  }, []);
+
+  const goDashboard = useCallback(() => {
+    abortRef.current?.abort();
+    setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
+    setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
+    setScanDeadline(null); checkpointRef.current = null; currentScanIdRef.current = null;
+    setStage("dashboard");
+    if (user) refreshScans(user);
+  }, [user, refreshScans]);
+
+  const startNewScan = useCallback(() => {
+    setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
+    setAnalysisError(null); setAnalysisWarning(null);
+    setReferenceBrief(""); setActivePresetId(null); currentScanIdRef.current = null;
+    setStage("upload");
+  }, []);
+
+  // Save the finished report to IndexedDB (with the video blob, so it replays).
+  const persistScan = useCallback(async (f, duration, issuesList, reuseId) => {
+    if (!f || !user) return;
+    const errors = issuesList.filter(i => i.severity === "error").length;
+    const warnings = issuesList.filter(i => i.severity === "warning").length;
+    const info = issuesList.filter(i => i.severity === "info").length;
+    const score = Math.max(0, 100 - errors * 12 - warnings * 4);
+    const id = reuseId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    currentScanIdRef.current = id;
+    await saveScan({
+      id, user, fileName: f.name || "video.mp4",
+      sizeMb: +((f.size || 0) / 1048576).toFixed(1),
+      durationSec: duration, createdAt: Date.now(),
+      issues: issuesList, score, errors, warnings, info,
+      briefUsed: briefWasUsed, blob: f,
+    });
+    refreshScans(user);
+  }, [user, briefWasUsed, refreshScans]);
+
+  // Reopen a saved report — restores findings + the video (from the stored blob).
+  const openScan = useCallback(async (id) => {
+    abortRef.current?.abort();
+    let rec = null;
+    try { rec = await idbGet(id); } catch { /* ignore */ }
+    if (!rec) return;
+    const f = rec.blob ? new File([rec.blob], rec.fileName, { type: rec.blob.type || "video/mp4" }) : null;
+    setFile(f);
+    setIssues(sortByTs(rec.issues || []));
+    setVideoDuration(rec.durationSec || 60);
+    setBriefWasUsed(!!rec.briefUsed);
+    setSelectedIssue(null); setCurrentTs(null);
+    setActiveTab("qc_technical"); setActiveFilter("all");
+    setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
+    checkpointRef.current = null; currentScanIdRef.current = id;
+    setStage("results");
+  }, []);
+
+  const deleteScan = useCallback(async (id) => {
+    try { await idbDelete(id); } catch { /* ignore */ }
+    if (user) refreshScans(user);
+  }, [user, refreshScans]);
 
   // Shared post-run handling: surface incomplete coverage + offer Resume.
   const finishRun = useCallback((result) => {
@@ -2539,10 +2842,12 @@ export default function App() {
         duration,
         brief: briefForThisRun,
         transcript,
+        file: f,                                          // kept so we can save the report (incl. blob)
         segments: segFrames.map((fr, i) => ({ id: i, frames: fr, status: "pending", issues: [] })),
         creativeDone: false,
         creativeIssues: [],
       };
+      currentScanIdRef.current = null;                    // fresh report id for this run
       checkpointRef.current = plan;
 
       // Start the live countdown against this mode's hard cap.
@@ -2568,6 +2873,8 @@ export default function App() {
       if (controller.signal.aborted) return;
       setIssues(sortByTs(finalIssues));
       finishRun(result);
+      // Save (or update, on resume) this report to the user's workspace history.
+      persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
       setStage("results");
@@ -2577,7 +2884,7 @@ export default function App() {
       console.error("Analysis failed:", e);
       setAnalysisError(e.message || "Analysis failed");
     }
-  }, [referenceBrief, mode, finishRun]);
+  }, [referenceBrief, mode, finishRun, persistScan]);
 
   // RESUME: re-run ONLY the segments still pending/failed/aborted. Completed
   // segments + their findings are preserved in checkpointRef.
@@ -2611,6 +2918,8 @@ export default function App() {
       if (controller.signal.aborted) return;
       setIssues(sortByTs(finalIssues));
       finishRun(result);
+      // Save (or update, on resume) this report to the user's workspace history.
+      persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
       setStage("results");
@@ -2619,7 +2928,7 @@ export default function App() {
       if (e.name === "AbortError") return;
       setAnalysisError(e.message || "Resume failed");
     }
-  }, [finishRun]);
+  }, [finishRun, persistScan]);
 
   const handleFile = useCallback((f) => {
     if (!f) return;
@@ -2691,8 +3000,19 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
-      <Nav apiStatus={apiStatus} />
+      <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} />
       <div style={{ maxWidth: 1480, margin: "0 auto", padding: "24px" }}>
+        {stage === "login" && <LoginStage onLogin={handleLogin} />}
+        {stage === "dashboard" && (
+          <DashboardStage
+            user={user}
+            scans={scans}
+            loading={dashLoading}
+            onNewScan={startNewScan}
+            onOpen={openScan}
+            onDelete={deleteScan}
+          />
+        )}
         {stage === "results" && analysisWarning && (
           <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.4)", display: "flex", gap: 12, alignItems: "flex-start" }}>
             <span style={{ fontSize: 16 }}>⚠️</span>
@@ -2768,7 +3088,7 @@ export default function App() {
             totalWarnings={totalWarnings}
             totalInfo={totalInfo}
             overallScore={overallScore}
-            onNewUpload={resetUpload}
+            onNewUpload={goDashboard}
             briefWasUsed={briefWasUsed}
           />
         )}
