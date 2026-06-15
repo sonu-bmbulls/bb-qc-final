@@ -2050,9 +2050,14 @@ function MagicPresetChips({ activeId, onPick }) {
   );
 }
 
-function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, apiStatus }) {
+function UploadStage({ dragOver, setDragOver, handleDrop, handleFile, fileRef, apiStatus, onDashboard }) {
   return (
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 108px)", paddingTop: 40, paddingBottom: 40 }}>
+      {onDashboard && (
+        <button onClick={onDashboard} style={{ alignSelf: "flex-start", marginBottom: 12, padding: "8px 14px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
+          ← Dashboard
+        </button>
+      )}
       <div style={{ textAlign: "center", marginBottom: 36 }}>
         <h1 style={{ fontSize: 44, fontWeight: 800, letterSpacing: "-0.02em", lineHeight: 1.05 }}>
           Catch every QC mistake.<br />
@@ -3198,6 +3203,7 @@ export default function App() {
             handleFile={handleFile}
             fileRef={fileRef}
             apiStatus={apiStatus}
+            onDashboard={goDashboard}
           />
         )}
         {stage === "confirm" && (
