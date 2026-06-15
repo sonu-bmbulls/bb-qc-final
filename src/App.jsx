@@ -156,6 +156,41 @@ function issuePriority(it) {
   return "ignore";
 }
 
+// ── Devanagari scrubber ───────────────────────────────────────────────────────
+// Output is LATIN HINGLISH ONLY, but Devanagari occasionally leaks into a field
+// (most often audioText, e.g. "ऑफिशियल कन्फर्मेशन नहीं की है (official ... hai)").
+// The prompt forbids it; this is the deterministic safety net. Strip the
+// Devanagari run, keep the romanized remainder, and tidy the leftovers
+// (empty quotes/parens, doubled spaces, space-before-punctuation).
+function hasDevanagari(s) { return typeof s === "string" && /[ऀ-ॿ]/.test(s); }
+function scrubDevanagari(s) {
+  if (typeof s !== "string" || !hasDevanagari(s)) return s;
+  return s
+    .replace(/[ऀ-ॿ]+/g, "")
+    .replace(/[“"'(]\s*[”")']/g, "")        // emptied quote/paren pairs
+    .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")
+    .replace(/\s+([.,;:!?)])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Soft / non-actionable findings: the model admits the text matches the audio or
+// is likely intentional, then raises a "verify…" concern. These are noise (the
+// editor can't act on "verify intent"). Kept separate from isNonIssue so the two
+// intents stay readable.
+function isSoftNonActionable(it) {
+  const m = `${it.msg || ""} ${it.why || ""} ${it.fix || ""}`.toLowerCase();
+  return /matches (the )?audio but|text matches audio but|may be intentional|verify intent|confirm.*(stylistic|intent)|verify if .*(should|is )|intentional animation reveal|animation reveal or caption hold|missing subject|context from (the )?(prior|previous) frame|incomplete without the subject|while technically correct|technically correct,? but|stands out in a hinglish|consider consistency with/i.test(m);
+}
+
+// Style / romanization variants and pure formatting prefs never change meaning,
+// so they are never "required" — cap them at "optional". Precise triggers only,
+// so genuine English typos (e.g. "operationa"→"operations") are NOT downgraded.
+function isStyleVariant(it) {
+  const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
+  return /\bvariant\b|non[- ]standard|informal|stylistic|romaniz|abbreviat|missing vowel|double[- ]letter|single[- ]e\b/i.test(m);
+}
+
 const T = {
   bg:        "#0a0608",
   bgPanel:   "rgba(255,255,255,0.025)",
@@ -1202,6 +1237,15 @@ be STRICT to avoid noise):
   • "ignore"   — acceptable as-is: valid Hinglish spelling variants, captions
     that already match the audio, animation reveal states.
 
+  NEVER "required" (cap at "optional") when the issue does NOT change meaning:
+    • Hinglish ROMANIZATION variants — krne/karne, mutabik/mutaabik, jissey/jisse,
+      valli/wali, vahin/wahi, sawaal/sawal. The word is still understood.
+    • Date / number FORMAT prefs — "JUN" vs "JUNE", "19 Jun" vs "19 June".
+    • Capitalization, terminal punctuation, ALL-CAPS-vs-Title-Case styling.
+  These are "optional" at most (often "ignore"). Reserve "required" for things
+  that genuinely break meaning or readability (mazboor/mazboot, hai/hain, wrong
+  price/name, a misspelling that yields a non-word).
+
 MINIMALISM — DO NOT ADD NOISE (this is critical):
   • NEVER emit a finding just to say something is CORRECT or needs "no change"
     (e.g. "caption matches audio", "this is correct Hinglish", "no fix
@@ -1353,11 +1397,21 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
     if (captionScope !== "all" && textSource === "visual") continue;
 
     const confidence = VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium";
-    const clean = (v, n) => (typeof v === "string" && v.trim() ? String(v).trim().slice(0, n) : null);
+    // clean() now also scrubs any leaked Devanagari, keeping the romanized text.
+    const clean = (v, n) => {
+      if (typeof v !== "string" || !v.trim()) return null;
+      const out = scrubDevanagari(v.trim()).slice(0, n).trim();
+      return out || null;
+    };
+    const msg = scrubDevanagari(String(item.msg).trim()).slice(0, 400).trim();
+    if (!msg) continue;                                  // was all-Devanagari → nothing left to show
+    const why = clean(item.why, 300);
     // Gate severity by confidence so only high-confidence defects read as errors.
     const sev = gateSeverityByConfidence(item.severity, confidence);
-    const priority = VALID_PRIORITY.has(item.priority) ? item.priority
+    let priority = VALID_PRIORITY.has(item.priority) ? item.priority
       : (sev === "error" ? "required" : sev === "warning" ? "optional" : "ignore");
+    // Style / romanization variants don't change meaning → never "required".
+    if (priority === "required" && isStyleVariant({ msg, why })) priority = "optional";
 
     issues.push({
       id: nextId++,
@@ -1373,8 +1427,8 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       ts,
       captionText: clean(item.captionText, 300),
       audioText: clean(item.audioText, 300),
-      msg: String(item.msg).slice(0, 400),
-      why: clean(item.why, 300),
+      msg,
+      why,
       fix: clean(item.fix, 800),
     });
   }
@@ -1579,7 +1633,7 @@ function reducePlan(plan) {
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isAllowlisted(it, allow));
+  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isAllowlisted(it, allow));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
