@@ -126,6 +126,11 @@ const CHECKS = [
 const VALID_CHECK_IDS = new Set(["grammar", "safezone", "quality", "audio", "color", "metadata"]);
 const VALID_SEVERITIES = new Set(["error", "warning", "info"]);
 const VALID_CONFIDENCE = new Set(["high", "medium", "low"]);
+// Where a finding's text lives: an intentional caption/subtitle/title overlay
+// added in the edit, vs incidental text filmed in the shot (iPad/notebook
+// handwriting, whiteboard, slide/document, app UI, signage). In "captions only"
+// scope we drop "visual" findings so rough notes never read as QC errors.
+const VALID_TEXT_SOURCE = new Set(["caption", "visual"]);
 const SEVERITY_RANK = { error: 3, warning: 2, info: 1 };
 // Only HIGH-confidence defects may be shown as "error". Medium caps at "warning",
 // low caps at "info" — graded down, never hidden. Keeps the report trustworthy.
@@ -687,9 +692,30 @@ async function analyzeFrames(frames, duration, signal, referenceBrief = "", pass
   const hasBrief = briefClean.length > 0;
   const isCreative = pass === "creative";
   const transcript = opts.transcript || null;
+  const captionScope = opts.captionScope === "all" ? "all" : "captions"; // default: captions only
   const loTs = frames[0]?.ts ?? 0;
   const hiTs = frames[frames.length - 1]?.ts ?? loTs;
   const audioText = (!isCreative && transcript) ? transcriptWindow(transcript, loTs, hiTs) : "";
+
+  // VOLATILE — which text gets QC'd this pass. Kept in the USER message so the
+  // big static system block stays byte-identical and prompt-cache-stable.
+  const scopeBlock = captionScope === "all"
+    ? `═══════════════════════════════════════════════════════════════════════════
+TEXT SCOPE FOR THIS PASS = ALL ON-SCREEN TEXT (user opted in)
+═══════════════════════════════════════════════════════════════════════════
+Check EVERY visible piece of text — captions/subtitles AND incidental in-shot text
+(iPad/notebook handwriting, whiteboard, slide/document, app UI, charts, signage).
+Set "textSource" correctly on each finding ("caption" or "visual").`
+    : `═══════════════════════════════════════════════════════════════════════════
+TEXT SCOPE FOR THIS PASS = CAPTIONS / SUBTITLES ONLY (default)
+═══════════════════════════════════════════════════════════════════════════
+Evaluate ONLY intentional caption / subtitle / title-card overlays. IGNORE
+incidental in-shot text — handwriting on an iPad or notebook, whiteboard or rough
+planning notes, slide / document text, app or website UI, chart labels, and
+background signage. Do NOT emit ANY finding (spelling, grammar, punctuation,
+capitalization, or audio mismatch) on that text — unless the audit instructions
+below explicitly ask for it. Every finding you DO emit must have
+"textSource": "caption". See the SCOPE GUARD rule in the system instructions.`;
 
   // ── PASS DIRECTIVE ──────────────────────────────────────────────────────────
   // VOLATILE — tells the model which job THIS call is doing. Lives in the USER
@@ -720,6 +746,8 @@ pass handles that. Scan every word in every frame.`;
   content.push({
     type: "text",
     text: `${directive}
+
+${scopeBlock}
 
 You will receive a sequence of ${frames.length} frames (video total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp — copy them verbatim.${hasBrief ? `
 
@@ -797,6 +825,42 @@ Critical: an English-spelled word inside a Hinglish sentence MUST still
 be spelled correctly in English. If the line is "Jab palm Jebel Ali
 compaaaete hoga", "compaaaete" is an English misspelling of "complete"
 and you flag it — the surrounding Hinglish does NOT excuse it.
+
+═══════════════════════════════════════════════════════════════════════════
+CAPTION / SUBTITLE TEXT vs INCIDENTAL VISUAL TEXT — SCOPE GUARD (READ FIRST)
+═══════════════════════════════════════════════════════════════════════════
+A frame often contains text that is NOT a caption: handwriting on an iPad or
+notebook, whiteboard notes, rough planning text, slide / PDF / document text,
+app or website UI, chart labels, product packaging, and background signage. This
+is part of the VISUAL CONTENT being filmed — it is NOT the subtitle/caption layer
+the editor burned in for the viewer, and it is usually rough by nature.
+
+The USER MESSAGE states the TEXT SCOPE for this pass:
+  • "captions only" (DEFAULT) → evaluate ONLY intentional caption / subtitle /
+    title-card overlays. Do NOT treat handwriting, iPad / notebook writing,
+    whiteboard content, slide / document text, app UI text, chart labels, or
+    background text as a QC error — say NOTHING about it (no spelling, grammar,
+    punctuation, capitalization, or audio-mismatch finding on incidental text),
+    UNLESS the user's audit instructions explicitly ask you to check that text.
+  • "all on-screen text" → evaluate every visible piece of text in the frame.
+
+HOW TO TELL A CAPTION APART (use these cues):
+  • Placement — captions sit as a dedicated lower-third / center overlay band, or
+    a styled title card; not handwritten inside a device or on paper.
+  • Styling — captions use a consistent edit font / box / stroke / shadow added in
+    post; incidental text wears the native look of its surface (handwriting, a UI
+    font, a slide template, printed packaging).
+  • Source — if the text lives INSIDE a filmed object (an iPad screen, a notebook
+    page, a whiteboard, a laptop window, a poster), it is incidental visual text.
+  • Intent — a caption restates / supports the voiceover for the viewer;
+    incidental text is just whatever happened to be in the shot.
+When genuinely unsure, and the text is NOT a clean lower-third / title overlay,
+default to treating it as incidental and do NOT flag it — this is what prevents
+rough notes and explanation text from becoming false errors.
+
+For every finding, set "textSource": "caption" for caption / subtitle / title
+overlay text, or "visual" for incidental in-shot text. In "captions only" scope
+you should normally emit ZERO "visual" findings.
 
 ═══════════════════════════════════════════════════════════════════════════
 REPEATED-LETTER TYPOS — ZERO-TOLERANCE
@@ -1027,6 +1091,7 @@ Each finding is an object with EXACTLY these fields, in this order:
   "severity":    "error" | "warning" | "info",
   "confidence":  "high" | "medium" | "low",
   "priority":    "required" | "optional" | "ignore",
+  "textSource":  "caption" | "visual",
   "captionText": "<exact on-screen text involved, Latin Hinglish>",
   "audioText":   "<what the voiceover says here, Latin Hinglish; empty if not audio-related>",
   "msg":         "<one-line headline of the issue>",
@@ -1038,6 +1103,12 @@ Each finding is an object with EXACTLY these fields, in this order:
   • "audio_mismatch" ONLY for a wrong VISIBLE word that contradicts the voiceover.
   • "truncation" ONLY for a word genuinely cut off that never completes anywhere.
   • otherwise the matching defect type (spelling / grammar / punctuation / ...).
+
+"textSource" — REQUIRED on every finding (see the SCOPE GUARD above):
+  • "caption" — the text is an intentional caption / subtitle / title-card overlay.
+  • "visual"  — the text is incidental in-shot content (iPad / notebook handwriting,
+    whiteboard, slide / document, app UI, chart, signage). In "captions only" scope
+    do NOT emit "visual" findings at all.
 
 "confidence" — how sure THIS is a real defect:
   • "high"   — unmistakable (clear typo, repeated-letter, clear audio mismatch).
@@ -1199,6 +1270,12 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       if (best && bestDiff <= 0.6) ts = best.ts;
     }
 
+    // SCOPE GUARD: in "captions only" mode, drop any finding the model tagged as
+    // incidental in-shot text (iPad/whiteboard/slide/UI/background). Untagged →
+    // treated as caption (kept), since the prompt already steers off visual text.
+    const textSource = VALID_TEXT_SOURCE.has(item.textSource) ? item.textSource : "caption";
+    if (captionScope !== "all" && textSource === "visual") continue;
+
     const confidence = VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium";
     const clean = (v, n) => (typeof v === "string" && v.trim() ? String(v).trim().slice(0, n) : null);
     // Gate severity by confidence so only high-confidence defects read as errors.
@@ -1216,6 +1293,7 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       confidence,
       priority,
       severity: sev,
+      textSource,
       ts,
       captionText: clean(item.captionText, 300),
       audioText: clean(item.audioText, 300),
@@ -1509,7 +1587,7 @@ async function analyzeSegments(plan, signal, cb = {}) {
     if (seg.ac.signal.aborted) { seg.remaining = Math.max(0, seg.remaining - 1); finalizeSeg(seg); return; }
     try {
       const r = await analyzeFrames(batch, duration, seg.ac.signal, brief, "technical",
-        { model: mode.model, maxTokens: mode.maxTokens, transcript: plan.transcript });
+        { model: mode.model, maxTokens: mode.maxTokens, transcript: plan.transcript, captionScope: plan.captionScope });
       seg.collected.push(...r.issues);
     } catch (e) {
       if (e.name !== "AbortError") { seg.hadError = true; console.error("[BB QC] batch failed:", e.message); }
@@ -1538,7 +1616,7 @@ async function analyzeSegments(plan, signal, cb = {}) {
     try {
       const creativeFrames = sampleEvenly(frames, CREATIVE_FRAME_COUNT);
       const r = await analyzeFrames(creativeFrames, duration, signal, brief, "creative",
-        { model: mode.model, maxTokens: mode.maxTokens });
+        { model: mode.model, maxTokens: mode.maxTokens, captionScope: plan.captionScope });
       plan.creativeIssues = r.issues;
       plan.creativeDone = true;
     } catch (e) {
@@ -1775,6 +1853,49 @@ function ModeSelector({ mode, setMode }) {
   );
 }
 
+// Text-scope toggle: QC only the caption/subtitle layer (default) or every piece
+// of on-screen text. Default avoids false errors from iPad notes, whiteboards,
+// slide text and other incidental in-shot text.
+function ScopeSelector({ scopeMode, setScopeMode }) {
+  const opts = [
+    { id: "captions", icon: "💬", label: "Check only captions", blurb: "Subtitles & title overlays only — ignores iPad notes, whiteboards, slides, app UI & background text" },
+    { id: "all",      icon: "🔍", label: "Check all on-screen text", blurb: "Also QCs handwriting, whiteboards, documents & every other visible word" },
+  ];
+  return (
+    <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
+      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>
+        🎯 Text scope
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        {opts.map((o) => {
+          const active = scopeMode === o.id;
+          return (
+            <button
+              key={o.id}
+              type="button"
+              onClick={() => setScopeMode(o.id)}
+              style={{
+                textAlign: "left", padding: "14px 16px", borderRadius: 12, cursor: "pointer",
+                background: active ? T.redTint : "rgba(255,255,255,0.025)",
+                border: `1px solid ${active ? T.borderHot : T.border}`,
+                boxShadow: active ? "0 4px 16px rgba(220,38,38,0.18)" : "none",
+                transition: "all 0.15s",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 16 }}>{o.icon}</span>
+                <span style={{ fontSize: 13, fontWeight: 800, color: active ? "white" : T.textMute }}>{o.label}</span>
+                {active && <span style={{ marginLeft: "auto", fontSize: 11, color: T.redLight }}>✓</span>}
+              </div>
+              <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>{o.blurb}</p>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ScoreRing({ score, size = 64 }) {
   const r = size * 0.4, circ = 2 * Math.PI * r;
   const color = score >= 80 ? "#10b981" : score >= 60 ? "#f59e0b" : T.redBright;
@@ -1931,6 +2052,11 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone }) {
         {!isCreative && (
           <span title={`${pr.label} priority`} style={{ fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: pr.color, background: `${pr.color}1a`, border: `1px solid ${pr.color}55` }}>
             {pr.short}
+          </span>
+        )}
+        {!isCreative && issue.textSource === "visual" && (
+          <span title="From incidental in-shot text (iPad / whiteboard / slide / UI), not the caption layer" style={{ fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: "#7dd3fc", background: "rgba(125,211,252,0.10)", border: "1px solid rgba(125,211,252,0.4)" }}>
+            📺 Visual text
           </span>
         )}
         <span style={{ fontSize: 11, color: T.textDim, marginLeft: "auto" }}>
@@ -2131,7 +2257,7 @@ function Stat({ label, value, highlight }) {
   );
 }
 
-function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId, mode, setMode }) {
+function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId, mode, setMode, scopeMode, setScopeMode }) {
   const briefChars = referenceBrief.length;
   const briefLimit = 4000;
   const sizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : "0";
@@ -2185,6 +2311,9 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
 
       {/* ── Speed-mode selector ──────────────────────────────────────────── */}
       <ModeSelector mode={mode} setMode={setMode} />
+
+      {/* ── Text-scope selector (captions only vs all on-screen text) ──────── */}
+      <ScopeSelector scopeMode={scopeMode} setScopeMode={setScopeMode} />
 
       {/* ── Cost calculator ──────────────────────────────────────────────── */}
       <div style={{ width: "100%", maxWidth: 540, marginBottom: 20, padding: "14px 16px", borderRadius: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.25)" }}>
@@ -2821,6 +2950,7 @@ export default function App() {
   const [activePresetId, setActivePresetId] = useState(null);
   const [briefWasUsed, setBriefWasUsed] = useState(false);
   const [mode, setMode] = useState(DEFAULT_MODE);          // "urgent" | "deep"
+  const [scopeMode, setScopeMode] = useState("captions");  // "captions" (default) | "all" — which on-screen text to QC
   const [scanDeadline, setScanDeadline] = useState(null);  // epoch ms for the live countdown
   const [scanCapMs, setScanCapMs] = useState(0);           // total cap (for the countdown bar)
   const [canResume, setCanResume] = useState(false);       // some segments still pending/failed
@@ -2952,6 +3082,7 @@ export default function App() {
     abortRef.current = controller;
 
     const briefForThisRun = referenceBrief.trim();
+    const captionScope = scopeMode;   // capture the text-scope toggle for this run
     const cfg = MODES[mode];
     setFile(f);
     setStage("analyzing");
@@ -2989,6 +3120,7 @@ export default function App() {
         duration,
         brief: briefForThisRun,
         transcript,
+        captionScope,                                     // "captions" (default) | "all"
         file: f,                                          // kept so we can save the report (incl. blob)
         segments: segFrames.map((fr, i) => ({ id: i, frames: fr, status: "pending", issues: [] })),
         creativeDone: false,
@@ -3031,7 +3163,7 @@ export default function App() {
       console.error("Analysis failed:", e);
       setAnalysisError(e.message || "Analysis failed");
     }
-  }, [referenceBrief, mode, finishRun, persistScan]);
+  }, [referenceBrief, mode, scopeMode, finishRun, persistScan]);
 
   // RESUME: re-run ONLY the segments still pending/failed/aborted. Completed
   // segments + their findings are preserved in checkpointRef.
@@ -3218,6 +3350,8 @@ export default function App() {
             setActivePresetId={setActivePresetId}
             mode={mode}
             setMode={setMode}
+            scopeMode={scopeMode}
+            setScopeMode={setScopeMode}
           />
         )}
         {stage === "analyzing" && (
