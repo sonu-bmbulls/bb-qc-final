@@ -134,6 +134,23 @@ function gateSeverityByConfidence(severity, confidence) {
   return SEVERITY_RANK[severity] <= SEVERITY_RANK[cap] ? severity : cap;
 }
 
+// ── Importance / triage (Frame.io-style) ──────────────────────────────────────
+const VALID_PRIORITY = new Set(["required", "optional", "ignore"]);
+const PRIORITY = {
+  required: { label: "Required Fix", short: "REQUIRED", color: "#ef4444" },
+  optional: { label: "Optional",     short: "OPTIONAL", color: "#f59e0b" },
+  ignore:   { label: "Unnecessary",  short: "IGNORE",   color: "#94a3b8" },
+};
+// A finding's importance: the model's priority if valid, else derived from the
+// confidence-gated severity. Drives the report's filters and the score.
+function issuePriority(it) {
+  if (it && VALID_PRIORITY.has(it.priority)) return it.priority;
+  if (!it) return "optional";
+  if (it.severity === "error") return "required";
+  if (it.severity === "warning") return "optional";
+  return "ignore";
+}
+
 const T = {
   bg:        "#0a0608",
   bgPanel:   "rgba(255,255,255,0.025)",
@@ -298,6 +315,72 @@ async function saveScan(rec) {
     console.warn("[BB QC] could not save scan:", e?.message);
     return false;
   }
+}
+
+// Export the report as a print-ready page (user saves as PDF). Opens a SEPARATE
+// window with its own clean stylesheet — the live web report is never touched.
+// Issues are ordered pending-first, then Required → Optional → Unnecessary.
+function exportReportPDF({ fileName, issues, doneIds, durationSec, score }) {
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const done = doneIds || new Set();
+  const counts = { required: 0, optional: 0, ignore: 0, done: 0 };
+  for (const i of issues) { if (done.has(i.id)) counts.done++; else counts[issuePriority(i)]++; }
+  const order = { required: 0, optional: 1, ignore: 2 };
+  const rows = [...issues].sort((a, b) => {
+    const da = done.has(a.id) ? 1 : 0, db = done.has(b.id) ? 1 : 0;
+    if (da !== db) return da - db;                                  // pending first
+    const pa = order[issuePriority(a)], pb = order[issuePriority(b)];
+    if (pa !== pb) return pa - pb;                                  // required → optional → ignore
+    return (a.ts ?? 1e9) - (b.ts ?? 1e9);
+  }).map((i) => {
+    const pr = issuePriority(i), isDone = done.has(i.id);
+    const status = isDone ? "DONE" : pr === "required" ? "REQUIRED" : pr === "optional" ? "OPTIONAL" : "IGNORE";
+    const col = isDone ? "#16a34a" : PRIORITY[pr].color;
+    return `<tr class="${isDone ? "done" : ""}">
+      <td class="ts">${esc(fmtTs(i.ts))}</td>
+      <td><span class="pill" style="background:${col}22;color:${col};border:1px solid ${col}66">${status}</span></td>
+      <td>
+        <div class="msg">${esc(i.msg)}</div>
+        ${i.captionText ? `<div class="sub"><b>Caption:</b> “${esc(i.captionText)}”</div>` : ""}
+        ${i.audioText ? `<div class="sub"><b>Voiceover:</b> “${esc(i.audioText)}”</div>` : ""}
+        ${i.why ? `<div class="sub"><b>Why:</b> ${esc(i.why)}</div>` : ""}
+        ${i.fix ? `<div class="fix"><b>Fix:</b> ${esc(i.fix)}</div>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>QC Report — ${esc(fileName)}</title>
+  <style>
+    *{box-sizing:border-box} body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;margin:0;padding:32px}
+    h1{font-size:22px;margin:0 0 4px} .meta{color:#666;font-size:12px;margin-bottom:18px}
+    .cards{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+    .card{border:1px solid #e5e5e5;border-radius:10px;padding:10px 16px;min-width:84px}
+    .card .n{font-size:22px;font-weight:800} .card .l{font-size:11px;color:#666}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th{text-align:left;color:#888;font-size:10px;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid #eee;padding:8px}
+    td{border-bottom:1px solid #f0f0f0;padding:10px 8px;vertical-align:top}
+    td.ts{font-family:monospace;color:#444;white-space:nowrap;width:48px}
+    .pill{font-size:9px;font-weight:800;padding:2px 8px;border-radius:20px;white-space:nowrap}
+    .msg{font-weight:600;margin-bottom:3px} .sub{color:#555;margin-top:2px} .fix{color:#b91c1c;margin-top:2px}
+    tr.done{opacity:.5} tr.done .msg{text-decoration:line-through}
+    @media print{body{padding:0}}
+  </style></head><body>
+    <h1>QC Report</h1>
+    <div class="meta">${esc(fileName)} · ${esc(fmtTs(durationSec))} · ${issues.length} findings · generated ${new Date().toLocaleString()}</div>
+    <div class="cards">
+      <div class="card"><div class="n">${score}</div><div class="l">Score</div></div>
+      <div class="card"><div class="n" style="color:#ef4444">${counts.required}</div><div class="l">Required</div></div>
+      <div class="card"><div class="n" style="color:#f59e0b">${counts.optional}</div><div class="l">Optional</div></div>
+      <div class="card"><div class="n" style="color:#94a3b8">${counts.ignore}</div><div class="l">Unnecessary</div></div>
+      <div class="card"><div class="n" style="color:#16a34a">${counts.done}</div><div class="l">Done</div></div>
+    </div>
+    <table><thead><tr><th>Time</th><th>Status</th><th>Issue</th></tr></thead><tbody>${rows}</tbody></table>
+    <script>window.onload=function(){setTimeout(function(){window.print();},300);};</script>
+  </body></html>`;
+
+  const w = window.open("", "_blank");
+  if (!w) { alert("Please allow pop-ups for this site to export the PDF report."); return; }
+  w.document.open(); w.document.write(html); w.document.close();
 }
 
 // List a user's scans (newest first) and purge anything past the 7-day window.
@@ -940,6 +1023,7 @@ Each finding is an object with EXACTLY these fields, in this order:
   "kind":        "audio_mismatch" | "spelling" | "grammar" | "punctuation" | "caps" | "layout" | "truncation" | "consistency" | "creative",
   "severity":    "error" | "warning" | "info",
   "confidence":  "high" | "medium" | "low",
+  "priority":    "required" | "optional" | "ignore",
   "captionText": "<exact on-screen text involved, Latin Hinglish>",
   "audioText":   "<what the voiceover says here, Latin Hinglish; empty if not audio-related>",
   "msg":         "<one-line headline of the issue>",
@@ -958,6 +1042,26 @@ Each finding is an object with EXACTLY these fields, in this order:
   • "low"    — possible but uncertain (blurry text, ambiguous audio).
 Reserve "error" severity for HIGH-confidence defects — only those are shown to
 the user as Errors; medium/low are shown at lower severity.
+
+"priority" — how much editor attention this needs (drives the report filters;
+be STRICT to avoid noise):
+  • "required" — must fix: meaning-changing typos, audio mismatches (wrong
+    word), wrong numbers / names / prices, broken or illegible text.
+  • "optional" — minor polish the editor MAY ignore: capitalization, line
+    breaks, punctuation, "verify spelling" suggestions, stylistic consistency.
+  • "ignore"   — acceptable as-is: valid Hinglish spelling variants, captions
+    that already match the audio, animation reveal states.
+
+MINIMALISM — DO NOT ADD NOISE (this is critical):
+  • NEVER emit a finding just to say something is CORRECT or needs "no change"
+    (e.g. "caption matches audio", "this is correct Hinglish", "no fix
+    required", "no error detected"). If it is fine, emit NOTHING.
+  • Do NOT repeat tiny spelling/capitalization nitpicks when the caption is
+    clearly understandable — mark them "optional", or skip them.
+  • Acceptable Hinglish variants (sawaal/sawal, roz/rozz) where the meaning is
+    unchanged are NOT errors — "optional" at most, usually skip. Only flag a
+    Hinglish word when the meaning clearly changes (mazboor vs mazboot).
+  • A clean caption that matches the audio should produce ZERO findings.
 
 Severity assignment (apply consistently):
   • Repeated-letter typo  → "warning" minimum, "error" preferred
@@ -1094,18 +1198,21 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
 
     const confidence = VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium";
     const clean = (v, n) => (typeof v === "string" && v.trim() ? String(v).trim().slice(0, n) : null);
+    // Gate severity by confidence so only high-confidence defects read as errors.
+    const sev = gateSeverityByConfidence(item.severity, confidence);
+    const priority = VALID_PRIORITY.has(item.priority) ? item.priority
+      : (sev === "error" ? "required" : sev === "warning" ? "optional" : "ignore");
 
     issues.push({
       id: nextId++,
       // This call was run in a single mode (technical batch OR creative pass),
-      // so force the category to match the mode. Guarantees correct tab
-      // placement regardless of how the model labelled the finding.
+      // so force the category to match the mode.
       category: isCreative ? "creative_retention" : "qc_technical",
       checkId: item.checkId,
       kind: clean(item.kind, 24) || (isCreative ? "creative" : "spelling"),
       confidence,
-      // Gate severity by confidence so only high-confidence defects read as errors.
-      severity: gateSeverityByConfidence(item.severity, confidence),
+      priority,
+      severity: sev,
       ts,
       captionText: clean(item.captionText, 300),
       audioText: clean(item.audioText, 300),
@@ -1298,16 +1405,23 @@ function isProgressiveCaptionFalsePositive(it) {
   return /caption (text )?incomplete|incomplete[^.]*caption|shows only|only the first|first phrase|does ?n.?t progress|not progress|audio continues|caption (does not|doesn.?t) (show|progress)|partial sentence|continues with/.test(m);
 }
 
+// Drop pure "this is correct / no change needed" confirmations — they are noise,
+// not findings (e.g. "caption matches audio", "correct Hinglish, no fix required").
+function isNonIssue(it) {
+  const m = `${it.msg || ""} ${it.fix || ""} ${it.why || ""}`.toLowerCase();
+  return /no change required|no fix required|no error detected|caption is correct|is correct hinglish|already correct|matches the voiceover|caption matches audio|caption is grammatically sound|no change needed|correct as[- ]is/.test(m);
+}
+
 // ── REDUCER ───────────────────────────────────────────────────────────────────
 // Combine the JSON outputs from every parallel segment (+ the creative pass)
-// back into ONE chronological timeline: flatten → drop progressive-reveal false
-// positives → dedupe → sort by absolute timestamp → renumber ids. Pure function
-// of the checkpoint `plan`, so it can run progressively AND at the very end.
+// back into ONE chronological timeline: flatten → drop progressive-reveal & "no
+// change" noise → dedupe → sort by absolute timestamp → renumber ids. Pure
+// function of the checkpoint `plan`, so it can run progressively AND at the end.
 function reducePlan(plan) {
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ].filter((it) => !isProgressiveCaptionFalsePositive(it));
+  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
@@ -1672,8 +1786,9 @@ function ScoreRing({ score, size = 64 }) {
   );
 }
 
-function Timeline({ issues, currentTs, duration, onSeek }) {
+function Timeline({ issues, currentTs, duration, doneIds, onSeek }) {
   const D = duration || 60;
+  const done = doneIds || new Set();
   const timedIssues = issues.filter(i => i.ts != null && i.ts <= D);
   const step = D > 30 ? 10 : Math.max(1, Math.round(D / 9));
   const ticks = [];
@@ -1703,25 +1818,26 @@ function Timeline({ issues, currentTs, duration, onSeek }) {
           const s = SEV[issue.severity];
           const isActive = currentTs != null && Math.abs(currentTs - issue.ts) < 0.5;
           const isCreative = issue.category === "creative_retention";
-          // Technical findings = solid colored dot (red/amber/green by severity).
-          // Creative findings  = hollow purple ring, so you can spot the two
-          // populations on the timeline without clicking through.
+          const isDone = done.has(issue.id);
+          // Technical = solid dot (red/amber/green by severity); creative = hollow
+          // purple ring; DONE = dimmed green dot. Spot the populations at a glance.
           return (
             <div
               key={issue.id}
               onClick={(e) => { e.stopPropagation(); onSeek(issue.ts); }}
-              title={`${fmtTs(issue.ts)} · ${isCreative ? "💡 " : ""}${issue.msg}`}
+              title={`${isDone ? "✓ done · " : ""}${fmtTs(issue.ts)} · ${isCreative ? "💡 " : ""}${issue.msg}`}
               style={{
                 position: "absolute", left, top: "50%", transform: "translate(-50%,-50%)",
                 width: isActive ? 16 : 11, height: isActive ? 16 : 11,
                 borderRadius: "50%",
-                background: isCreative ? "transparent" : s.dot,
+                background: isDone ? "#10b981" : (isCreative ? "transparent" : s.dot),
+                opacity: isDone ? 0.45 : 1,
                 cursor: "pointer",
-                border: isCreative
+                border: (isCreative && !isDone)
                   ? `2px solid ${T.purpleBright}`
                   : (isActive ? `2px solid white` : `2px solid rgba(0,0,0,0.5)`),
                 boxShadow: isActive
-                  ? `0 0 0 4px ${(isCreative ? T.purpleBright : s.dot)}55`
+                  ? `0 0 0 4px ${(isDone ? "#10b981" : isCreative ? T.purpleBright : s.dot)}55`
                   : "none",
                 transition: "all 0.15s ease", zIndex: isActive ? 10 : 5,
               }}
@@ -1742,13 +1858,14 @@ function Timeline({ issues, currentTs, duration, onSeek }) {
   );
 }
 
-function IssueCard({ issue, isSelected, onClick }) {
+function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone }) {
   const s = SEV[issue.severity];
   const check = CHECKS.find(c => c.id === issue.checkId);
   const isCreative = issue.category === "creative_retention";
-  // Creative cards get a purple left-stripe + subtle purple glow on hover/select
-  // so they're visually distinct even if you somehow see them mixed in.
-  const stripeColor = isCreative ? T.purpleBright : s.dot;
+  const priority = issuePriority(issue);
+  const pr = PRIORITY[priority];
+  // Creative cards get a purple left-stripe; completed items go green + dimmed.
+  const stripeColor = isDone ? "#10b981" : isCreative ? T.purpleBright : s.dot;
   const selectedBorder = isCreative ? T.purpleBright + "60" : s.dot + "60";
   const selectedBg = isCreative ? T.purpleTint : s.bg;
   return (
@@ -1762,6 +1879,7 @@ function IssueCard({ issue, isSelected, onClick }) {
         border: `1px solid ${isSelected ? selectedBorder : T.border}`,
         cursor: "pointer",
         transition: "all 0.15s",
+        opacity: isDone ? 0.55 : 1,
         boxShadow: isSelected && isCreative ? "0 0 24px rgba(168,85,247,0.15)" : "none",
       }}
     >
@@ -1807,11 +1925,16 @@ function IssueCard({ issue, isSelected, onClick }) {
             {issue.confidence}
           </span>
         )}
+        {!isCreative && (
+          <span title={`${pr.label} priority`} style={{ fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: pr.color, background: `${pr.color}1a`, border: `1px solid ${pr.color}55` }}>
+            {pr.short}
+          </span>
+        )}
         <span style={{ fontSize: 11, color: T.textDim, marginLeft: "auto" }}>
           {check?.icon} {check?.label}
         </span>
       </div>
-      <p style={{ fontSize: 13, color: "white", lineHeight: 1.45, fontWeight: 600 }}>{issue.msg}</p>
+      <p style={{ fontSize: 13, color: "white", lineHeight: 1.45, fontWeight: 600, textDecoration: isDone ? "line-through" : "none" }}>{issue.msg}</p>
       <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6 }}>
         {issue.captionText && (
           <p style={{ fontSize: 11.5, lineHeight: 1.5, margin: 0 }}>
@@ -1836,6 +1959,20 @@ function IssueCard({ issue, isSelected, onClick }) {
           </p>
         )}
       </div>
+      {onToggleDone && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onToggleDone(issue.id); }}
+          style={{
+            marginTop: 10, padding: "6px 12px", borderRadius: 8, cursor: "pointer",
+            border: `1px solid ${isDone ? "rgba(16,185,129,0.5)" : T.border}`,
+            background: isDone ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.04)",
+            color: isDone ? "#34d399" : T.textMute, fontSize: 11, fontWeight: 700,
+            display: "inline-flex", alignItems: "center", gap: 6,
+          }}
+        >
+          {isDone ? "✓ Done — reopen" : "✓ Mark done"}
+        </button>
+      )}
     </div>
   );
 }
@@ -2272,7 +2409,8 @@ function ResultsStage(props) {
     issues, filteredIssues, activeFilter, setActiveFilter,
     activeTab, setActiveTab,
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
-    totalErrors, totalWarnings, totalInfo, overallScore, onNewUpload, briefWasUsed,
+    requiredCount, optionalCount, ignoreCount, doneCount,
+    overallScore, onNewUpload, onExport, doneIds, toggleDone, briefWasUsed,
   } = props;
 
   const timedIssues = issues.filter(i => i.ts != null);
@@ -2302,7 +2440,7 @@ function ResultsStage(props) {
           <button onClick={onNewUpload} style={{ padding: "9px 18px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
             ← Dashboard
           </button>
-          <button style={{ padding: "9px 18px", borderRadius: 9, background: T.gradient, color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 8px rgba(220,38,38,0.3)" }}>
+          <button onClick={onExport} style={{ padding: "9px 18px", borderRadius: 9, background: T.gradient, color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 8px rgba(220,38,38,0.3)" }}>
             ⬇ Export PDF
           </button>
         </div>
@@ -2310,10 +2448,10 @@ function ResultsStage(props) {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 24 }}>
         <StatCard ring score={overallScore} label="Overall Score" />
-        <StatCard value={totalErrors} label="Errors" color={T.redBright} />
-        <StatCard value={totalWarnings} label="Warnings" color="#f59e0b" />
-        <StatCard value={totalInfo} label="Info" color="#10b981" />
-        <StatCard value={timedIssues.length} label="Timed Issues" color={T.redLight} />
+        <StatCard value={requiredCount} label="Required" color={T.redBright} />
+        <StatCard value={optionalCount} label="Optional" color="#f59e0b" />
+        <StatCard value={ignoreCount} label="Unnecessary" color="#94a3b8" />
+        <StatCard value={doneCount} label="Done" color="#10b981" />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.6fr) minmax(340px, 1fr)", gap: 20, alignItems: "start" }}>
@@ -2360,6 +2498,7 @@ function ResultsStage(props) {
               issues={issues}
               currentTs={currentTs}
               duration={videoDuration}
+              doneIds={doneIds}
               onSeek={(ts) => {
                 setCurrentTs(ts);
                 if (timedIssues.length === 0) return;
@@ -2424,7 +2563,7 @@ function ResultsStage(props) {
               return (
                 <button
                   key={catId}
-                  onClick={() => { setActiveTab(catId); setActiveFilter("all"); }}
+                  onClick={() => { setActiveTab(catId); setActiveFilter(catId === "qc_technical" ? "required" : "all"); }}
                   style={{
                     flex: 1,
                     padding: "14px 16px",
@@ -2463,26 +2602,21 @@ function ResultsStage(props) {
               {CATEGORIES[activeTab].desc}
             </p>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              <FilterChip
-                label="All"
-                count={issues.filter(i => i.category === activeTab).length}
-                active={activeFilter === "all"}
-                onClick={() => setActiveFilter("all")}
-                color={CATEGORIES[activeTab].accent}
-              />
               {(() => {
-                // Sev counts within the active tab only
+                // Priority counts within the active tab (pending = not done).
                 const inTab = issues.filter(i => i.category === activeTab);
-                const errs = inTab.filter(i => i.severity === "error").length;
-                const warns = inTab.filter(i => i.severity === "warning").length;
-                const infos = inTab.filter(i => i.severity === "info").length;
+                const pend = inTab.filter(i => !doneIds.has(i.id));
+                const req = pend.filter(i => issuePriority(i) === "required").length;
+                const opt = pend.filter(i => issuePriority(i) === "optional").length;
+                const ign = pend.filter(i => issuePriority(i) === "ignore").length;
+                const dn = inTab.filter(i => doneIds.has(i.id)).length;
                 return (
                   <>
-                    {errs > 0 && <FilterChip label="Errors" count={errs} active={activeFilter === "error"} onClick={() => setActiveFilter("error")} color={T.redBright} />}
-                    {warns > 0 && <FilterChip label="Warnings" count={warns} active={activeFilter === "warning"} onClick={() => setActiveFilter("warning")} color="#f59e0b" />}
-                    {infos > 0 && activeTab === "creative_retention" && (
-                      <FilterChip label="Ideas" count={infos} active={activeFilter === "info"} onClick={() => setActiveFilter("info")} color={T.purpleBright} />
-                    )}
+                    <FilterChip label="Required" count={req} active={activeFilter === "required"} onClick={() => setActiveFilter("required")} color={T.redBright} />
+                    <FilterChip label="Optional" count={opt} active={activeFilter === "optional"} onClick={() => setActiveFilter("optional")} color="#f59e0b" />
+                    <FilterChip label="Unnecessary" count={ign} active={activeFilter === "unnecessary"} onClick={() => setActiveFilter("unnecessary")} color="#94a3b8" />
+                    <FilterChip label="Done" count={dn} active={activeFilter === "done"} onClick={() => setActiveFilter("done")} color="#10b981" />
+                    <FilterChip label="All pending" count={pend.length} active={activeFilter === "all"} onClick={() => setActiveFilter("all")} color={CATEGORIES[activeTab].accent} />
                   </>
                 );
               })()}
@@ -2509,6 +2643,8 @@ function ResultsStage(props) {
                   issue={issue}
                   isSelected={selectedIssue?.id === issue.id}
                   onClick={seekToIssue}
+                  isDone={doneIds.has(issue.id)}
+                  onToggleDone={toggleDone}
                 />
               ))
             )}
@@ -2670,7 +2806,7 @@ export default function App() {
   const [videoDuration, setVideoDuration] = useState(60);
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [currentTs, setCurrentTs] = useState(null);
-  const [activeFilter, setActiveFilter] = useState("all");
+  const [activeFilter, setActiveFilter] = useState("required"); // required|optional|unnecessary|done|all
   const [activeTab, setActiveTab] = useState("qc_technical"); // qc_technical | creative_retention
   const [apiStatus, setApiStatus] = useState({ probed: false, ok: false, detail: "" });
   const [referenceBrief, setReferenceBrief] = useState("");
@@ -2680,6 +2816,7 @@ export default function App() {
   const [scanDeadline, setScanDeadline] = useState(null);  // epoch ms for the live countdown
   const [scanCapMs, setScanCapMs] = useState(0);           // total cap (for the countdown bar)
   const [canResume, setCanResume] = useState(false);       // some segments still pending/failed
+  const [doneIds, setDoneIds] = useState(() => new Set()); // issue ids the editor marked complete
 
   const fileRef = useRef(null);
   const videoRef = useRef(null);
@@ -2776,8 +2913,9 @@ export default function App() {
     setIssues(sortByTs(rec.issues || []));
     setVideoDuration(rec.durationSec || 60);
     setBriefWasUsed(!!rec.briefUsed);
+    setDoneIds(new Set(rec.doneIds || []));
     setSelectedIssue(null); setCurrentTs(null);
-    setActiveTab("qc_technical"); setActiveFilter("all");
+    setActiveTab("qc_technical"); setActiveFilter("required");
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = id;
     setStage("results");
@@ -2814,8 +2952,9 @@ export default function App() {
     setCurrentTs(null);
     setAnalysisError(null);
     setAnalysisWarning(null);
-    setActiveFilter("all");
+    setActiveFilter("required");
     setCanResume(false);
+    setDoneIds(new Set());
     setBriefWasUsed(briefForThisRun.length > 0);
 
     try {
@@ -2979,24 +3118,42 @@ export default function App() {
     if (next) seekToIssue(next);
   };
 
-  const totalErrors = issues.filter(i => i.severity === "error").length;
-  const totalWarnings = issues.filter(i => i.severity === "warning").length;
-  const totalInfo = issues.filter(i => i.severity === "info").length;
-  const overallScore = Math.max(0, 100 - totalErrors * 12 - totalWarnings * 4);
+  // Counts + score by IMPORTANCE (not raw severity), so optional/unnecessary
+  // items don't tank the score. Done items don't count against it.
+  const requiredCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "required").length;
+  const optionalCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "optional").length;
+  const ignoreCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "ignore").length;
+  const doneCount = issues.filter(i => doneIds.has(i.id)).length;
+  const overallScore = Math.max(0, Math.min(100, 100 - requiredCount * 12 - optionalCount * 3));
 
   const filteredIssues = useMemo(() => {
-    // First filter: only show findings in the currently active tab/category
     let list = issues.filter(i => i.category === activeTab);
-    // Second filter: apply the severity / check filter chip if not "all"
-    if (activeFilter !== "all") {
-      if (["error", "warning", "info"].includes(activeFilter)) {
-        list = list.filter(i => i.severity === activeFilter);
-      } else {
-        list = list.filter(i => i.checkId === activeFilter);
-      }
-    }
-    return list;
-  }, [issues, activeTab, activeFilter]);
+    if (activeFilter === "done") return list.filter(i => doneIds.has(i.id));
+    list = list.filter(i => !doneIds.has(i.id));              // hide completed from the working views
+    if (activeFilter === "all") return list;
+    const want = activeFilter === "unnecessary" ? "ignore" : activeFilter; // required | optional | ignore
+    return list.filter(i => issuePriority(i) === want);
+  }, [issues, activeTab, activeFilter, doneIds]);
+
+  // Mark an issue complete (or reopen it) and persist done-state to the report.
+  const toggleDone = useCallback((id) => {
+    setDoneIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      const scanId = currentScanIdRef.current;
+      if (scanId) (async () => {
+        try {
+          const rec = await idbGet(scanId);
+          if (rec) { await saveScan({ ...rec, doneIds: [...next] }); if (user) refreshScans(user); }
+        } catch { /* ignore */ }
+      })();
+      return next;
+    });
+  }, [user, refreshScans]);
+
+  const handleExport = useCallback(() => {
+    exportReportPDF({ fileName: file?.name || "video.mp4", issues, doneIds, durationSec: videoDuration, score: overallScore });
+  }, [file, issues, doneIds, videoDuration, overallScore]);
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
@@ -3084,11 +3241,15 @@ export default function App() {
             selectedIssue={selectedIssue}
             seekToIssue={seekToIssue}
             navigateIssue={navigateIssue}
-            totalErrors={totalErrors}
-            totalWarnings={totalWarnings}
-            totalInfo={totalInfo}
+            requiredCount={requiredCount}
+            optionalCount={optionalCount}
+            ignoreCount={ignoreCount}
+            doneCount={doneCount}
             overallScore={overallScore}
             onNewUpload={goDashboard}
+            onExport={handleExport}
+            doneIds={doneIds}
+            toggleDone={toggleDone}
             briefWasUsed={briefWasUsed}
           />
         )}
