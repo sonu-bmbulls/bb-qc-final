@@ -272,6 +272,60 @@ function clearStoredUser() { try { localStorage.removeItem(USER_KEY); } catch { 
 // Identity key: "sonu", "Sonu", "SONU", " soNu " all map to the SAME workspace.
 function normalizeUser(name) { return (name || "").trim().replace(/\s+/g, " ").toLowerCase(); }
 
+// ── QC MEMORY — per-user "learned corrections" (localStorage, no DB) ──────────
+// Works exactly like a spell-checker's custom dictionary: a correction the editor
+// teaches ONCE is injected into EVERY future scan's prompt (and, for the
+// allow-list, enforced deterministically in code). Keyed by the SAME normalized
+// identity as scans, so sonu / Sonu / SONU share one memory. Two lists:
+//   • allow — words/phrases confirmed CORRECT → never flagged again ("Learn word")
+//   • typos — wrong→right pairs the AI MISSED before → actively watched for
+const MEMORY_KEY = "bbqc_memory";
+const MEMORY_LIMIT = 200;                       // cap each list so the prompt stays small
+const EMPTY_MEMORY = { allow: [], typos: [] };
+function loadAllMemory() {
+  try { return JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}") || {}; } catch { return {}; }
+}
+function loadMemory(user) {
+  const m = loadAllMemory()[normalizeUser(user)] || {};
+  return { allow: Array.isArray(m.allow) ? m.allow : [], typos: Array.isArray(m.typos) ? m.typos : [] };
+}
+function saveMemory(user, mem) {
+  if (!user) return;
+  try {
+    const all = loadAllMemory();
+    all[normalizeUser(user)] = {
+      allow: (mem.allow || []).slice(-MEMORY_LIMIT),
+      typos: (mem.typos || []).slice(-MEMORY_LIMIT),
+    };
+    localStorage.setItem(MEMORY_KEY, JSON.stringify(all));
+  } catch { /* ignore quota */ }
+}
+function normTerm(s) { return (s || "").trim().toLowerCase(); }
+function reEsc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+// Deterministic allow-list guard: should this finding be suppressed because the
+// editor already confirmed the word is correct? CONSERVATIVE on purpose — only
+// touches "is this spelled/written right" kinds (never audio-mismatch / layout /
+// creative), and only when an allowed term appears as a whole word in the caption.
+// This means a real typo ("namsate") is still flagged even if "namaste" is allowed.
+const ALLOWLIST_KINDS = new Set(["spelling", "grammar", "caps", "truncation", "consistency", "punctuation"]);
+function isAllowlisted(issue, allow) {
+  if (!issue || !allow || !allow.length) return false;
+  if (issue.category === "creative_retention") return false;
+  if (issue.kind && !ALLOWLIST_KINDS.has(issue.kind)) return false;
+  const cap = normTerm(issue.captionText);
+  if (!cap) return false;
+  return allow.some((a) => {
+    const t = normTerm(a.term);
+    if (!t) return false;
+    if (t.includes(" ")) return cap.includes(t);                         // phrase → substring
+    return new RegExp(`(^|[^a-z0-9])${reEsc(t)}([^a-z0-9]|$)`, "i").test(cap); // word → whole-token
+  });
+}
+function filterAllowlisted(issues, allow) {
+  return (allow && allow.length) ? (issues || []).filter((i) => !isAllowlisted(i, allow)) : (issues || []);
+}
+
 function fmtDate(ms) {
   try { return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); }
   catch { return "—"; }
@@ -693,6 +747,8 @@ async function analyzeFrames(frames, duration, signal, referenceBrief = "", pass
   const isCreative = pass === "creative";
   const transcript = opts.transcript || null;
   const captionScope = opts.captionScope === "all" ? "all" : "captions"; // default: captions only
+  const memRaw = opts.memory || null;
+  const memory = (!isCreative && memRaw && ((memRaw.allow?.length || 0) + (memRaw.typos?.length || 0) > 0)) ? memRaw : null;
   const loTs = frames[0]?.ts ?? 0;
   const hiTs = frames[frames.length - 1]?.ts ?? loTs;
   const audioText = (!isCreative && transcript) ? transcriptWindow(transcript, loTs, hiTs) : "";
@@ -716,6 +772,24 @@ background signage. Do NOT emit ANY finding (spelling, grammar, punctuation,
 capitalization, or audio mismatch) on that text — unless the audit instructions
 below explicitly ask for it. Every finding you DO emit must have
 "textSource": "caption". See the SCOPE GUARD rule in the system instructions.`;
+
+  // VOLATILE — the editor's learned corrections (allow-list + known typos). Kept
+  // in the USER message so the cached system block stays byte-identical. Functions
+  // like a spell-checker's custom dictionary fed back to the model every scan.
+  const memoryBlock = memory ? `═══════════════════════════════════════════════════════════════════════════
+EDITOR'S LEARNED CORRECTIONS — AUTHORITATIVE, APPLY ON EVERY PASS
+═══════════════════════════════════════════════════════════════════════════
+The editor has manually corrected this QC system before. Honor it exactly.${memory.allow?.length ? `
+
+ALWAYS-CORRECT TEXT — confirmed correct by the editor. Treat these EXACTLY like
+dictionary words: NEVER flag them as spelling / grammar / typo errors, even inside
+Hinglish. (A genuinely different misspelling of the same word is still an error.)
+${memory.allow.map((a) => `  • "${a.term}"${a.note ? ` — ${a.note}` : ""}`).join("\n")}` : ""}${memory.typos?.length ? `
+
+KNOWN MISTAKES TO CATCH — the editor reported these were MISSED in earlier scans.
+If the WRONG (left) form appears on screen, you MUST flag it as an "error" and give
+the right (corrected) form as the fix:
+${memory.typos.map((t) => `  • "${t.wrong}" → "${t.right}"`).join("\n")}` : ""}` : "";
 
   // ── PASS DIRECTIVE ──────────────────────────────────────────────────────────
   // VOLATILE — tells the model which job THIS call is doing. Lives in the USER
@@ -747,7 +821,9 @@ pass handles that. Scan every word in every frame.`;
     type: "text",
     text: `${directive}
 
-${scopeBlock}
+${scopeBlock}${memoryBlock ? `
+
+${memoryBlock}` : ""}
 
 You will receive a sequence of ${frames.length} frames (video total duration ${Math.round(duration)} seconds). Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp — copy them verbatim.${hasBrief ? `
 
@@ -1499,10 +1575,11 @@ function isNonIssue(it) {
 // change" noise → dedupe → sort by absolute timestamp → renumber ids. Pure
 // function of the checkpoint `plan`, so it can run progressively AND at the end.
 function reducePlan(plan) {
+  const allow = plan.memory?.allow;
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it));
+  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isAllowlisted(it, allow));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
@@ -1587,7 +1664,7 @@ async function analyzeSegments(plan, signal, cb = {}) {
     if (seg.ac.signal.aborted) { seg.remaining = Math.max(0, seg.remaining - 1); finalizeSeg(seg); return; }
     try {
       const r = await analyzeFrames(batch, duration, seg.ac.signal, brief, "technical",
-        { model: mode.model, maxTokens: mode.maxTokens, transcript: plan.transcript, captionScope: plan.captionScope });
+        { model: mode.model, maxTokens: mode.maxTokens, transcript: plan.transcript, captionScope: plan.captionScope, memory: plan.memory });
       seg.collected.push(...r.issues);
     } catch (e) {
       if (e.name !== "AbortError") { seg.hadError = true; console.error("[BB QC] batch failed:", e.message); }
@@ -1982,7 +2059,9 @@ function Timeline({ issues, currentTs, duration, doneIds, onSeek }) {
   );
 }
 
-function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone }) {
+function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCorrect }) {
+  const [learning, setLearning] = useState(false);
+  const [term, setTerm] = useState("");
   const s = SEV[issue.severity];
   const check = CHECKS.find(c => c.id === issue.checkId);
   const isCreative = issue.category === "creative_retention";
@@ -2089,18 +2168,63 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone }) {
         )}
       </div>
       {onToggleDone && (
-        <button
-          onClick={(e) => { e.stopPropagation(); onToggleDone(issue.id); }}
-          style={{
-            marginTop: 10, padding: "6px 12px", borderRadius: 8, cursor: "pointer",
-            border: `1px solid ${isDone ? "rgba(16,185,129,0.5)" : T.border}`,
-            background: isDone ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.04)",
-            color: isDone ? "#34d399" : T.textMute, fontSize: 11, fontWeight: 700,
-            display: "inline-flex", alignItems: "center", gap: 6,
-          }}
-        >
-          {isDone ? "✓ Done — reopen" : "✓ Mark done"}
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10, alignItems: "center" }}>
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleDone(issue.id); }}
+            style={{
+              padding: "6px 12px", borderRadius: 8, cursor: "pointer",
+              border: `1px solid ${isDone ? "rgba(16,185,129,0.5)" : T.border}`,
+              background: isDone ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.04)",
+              color: isDone ? "#34d399" : T.textMute, fontSize: 11, fontWeight: 700,
+              display: "inline-flex", alignItems: "center", gap: 6,
+            }}
+          >
+            {isDone ? "✓ Done — reopen" : "✓ Mark done"}
+          </button>
+          {onLearnCorrect && !isCreative && !learning && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setTerm(issue.captionText || ""); setLearning(true); }}
+              title="Tell the AI this is actually correct — it won't flag this word again on any video"
+              style={{
+                padding: "6px 12px", borderRadius: 8, cursor: "pointer",
+                border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)",
+                color: T.textMute, fontSize: 11, fontWeight: 700,
+                display: "inline-flex", alignItems: "center", gap: 6,
+              }}
+            >
+              ✗ Not an error — learn
+            </button>
+          )}
+        </div>
+      )}
+      {learning && (
+        <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 10, padding: 10, borderRadius: 8, background: "rgba(125,211,252,0.06)", border: "1px solid rgba(125,211,252,0.3)" }}>
+          <p style={{ fontSize: 10.5, color: T.textDim, marginBottom: 6, lineHeight: 1.4 }}>
+            Mark as correct — the AI will never flag this word again (on any video). Trim to just the correct word for best reuse.
+          </p>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <input
+              value={term}
+              autoFocus
+              onChange={(e) => setTerm(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && term.trim()) { onLearnCorrect(issue, term.trim()); } if (e.key === "Escape") setLearning(false); }}
+              placeholder="correct word or phrase"
+              style={{ flex: 1, minWidth: 150, padding: "6px 10px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: `1px solid ${T.border}`, color: "white", fontSize: 11.5, outline: "none" }}
+            />
+            <button
+              onClick={() => { const t = term.trim(); if (t) onLearnCorrect(issue, t); }}
+              style={{ padding: "6px 12px", borderRadius: 8, cursor: "pointer", border: "1px solid rgba(125,211,252,0.5)", background: "rgba(125,211,252,0.14)", color: "#7dd3fc", fontSize: 11, fontWeight: 800 }}
+            >
+              ✓ Learn word
+            </button>
+            <button
+              onClick={() => setLearning(false)}
+              style={{ padding: "6px 12px", borderRadius: 8, cursor: "pointer", border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11, fontWeight: 700 }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -2540,6 +2664,76 @@ function FilterChip({ label, count, active, onClick, color }) {
   );
 }
 
+// "Learned corrections" manager — review/remove what the AI has been taught.
+function MemoryPanel({ memory, onUnlearn, onClose }) {
+  const allow = memory?.allow || [], typos = memory?.typos || [];
+  const chip = (children, key, onX) => (
+    <span key={key} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 20, background: "rgba(255,255,255,0.05)", border: `1px solid ${T.border}`, fontSize: 11.5, color: "white" }}>
+      {children}
+      <button onClick={onX} title="Forget this" style={{ cursor: "pointer", color: T.textDim, fontSize: 13, lineHeight: 1, padding: 0 }}>×</button>
+    </span>
+  );
+  return (
+    <div style={{ marginBottom: 20, padding: 18, borderRadius: 14, background: T.bgPanel, border: `1px solid ${T.border}` }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 15 }}>🧠</span>
+          <span style={{ fontSize: 14, fontWeight: 800 }}>Learned corrections</span>
+          <span style={{ fontSize: 11, color: T.textDim }}>· applies to all your future scans</span>
+        </div>
+        <button onClick={onClose} style={{ cursor: "pointer", color: T.textDim, fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 8, border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)" }}>Close</button>
+      </div>
+
+      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", marginBottom: 8 }}>
+        ✓ Always correct · never flag ({allow.length})
+      </div>
+      {allow.length === 0 ? (
+        <p style={{ fontSize: 11.5, color: T.textDim, marginBottom: 14 }}>Nothing yet. On a wrong finding, click <strong>“✗ Not an error — learn”</strong> to teach the AI a word is correct.</p>
+      ) : (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+          {allow.map((a, i) => chip(<span>“{a.term}”</span>, `a${i}`, () => onUnlearn("allow", i)))}
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", marginBottom: 8 }}>
+        🔎 Known mistakes · always catch ({typos.length})
+      </div>
+      {typos.length === 0 ? (
+        <p style={{ fontSize: 11.5, color: T.textDim }}>Nothing yet. Use <strong>“+ Add missed issue”</strong> to record a typo the AI should always catch.</p>
+      ) : (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {typos.map((t, i) => chip(<span style={{ fontFamily: "DM Mono, monospace" }}>“{t.wrong}” → “{t.right}”</span>, `t${i}`, () => onUnlearn("typos", i)))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Inline form to add a finding the AI missed (and remember it for next time).
+function AddMissedForm({ defaultTs, onAdd, onClose }) {
+  const [wrong, setWrong] = useState("");
+  const [right, setRight] = useState("");
+  const [note, setNote] = useState("");
+  const fld = { padding: "7px 10px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: `1px solid ${T.border}`, color: "white", fontSize: 12, outline: "none", width: "100%" };
+  const save = () => { if (wrong.trim() || right.trim() || note.trim()) { onAdd({ ts: defaultTs, wrong, right, note }); onClose(); } };
+  return (
+    <div style={{ padding: 12, borderRadius: 10, background: "rgba(239,68,68,0.05)", border: "1px solid rgba(239,68,68,0.3)", marginBottom: 8 }}>
+      <p style={{ fontSize: 11, color: T.textDim, marginBottom: 8, lineHeight: 1.45 }}>
+        Add an issue the AI missed at <strong style={{ color: "white" }}>{fmtTs(defaultTs ?? 0)}</strong>. If you fill both fields, the AI will watch for this typo on every future scan.
+      </p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+        <input value={wrong} autoFocus onChange={(e) => setWrong(e.target.value)} placeholder="Wrong text on screen (e.g. Bedrtoom)" style={fld} />
+        <input value={right} onChange={(e) => setRight(e.target.value)} placeholder="Should be (e.g. Bedroom)" style={fld} />
+      </div>
+      <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" style={{ ...fld, marginBottom: 8 }} />
+      <div style={{ display: "flex", gap: 6 }}>
+        <button onClick={save} style={{ padding: "7px 14px", borderRadius: 8, cursor: "pointer", border: "none", background: T.gradient, color: "white", fontSize: 11.5, fontWeight: 800 }}>＋ Add to report</button>
+        <button onClick={onClose} style={{ padding: "7px 14px", borderRadius: 8, cursor: "pointer", border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11.5, fontWeight: 700 }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
 function ResultsStage(props) {
   const {
     file, videoUrl, videoRef, seekFromExternal, videoDuration, setVideoDuration,
@@ -2548,7 +2742,11 @@ function ResultsStage(props) {
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
     requiredCount, optionalCount, ignoreCount, doneCount,
     overallScore, onNewUpload, onExport, doneIds, toggleDone, briefWasUsed,
+    memory, onLearnCorrect, onAddMissed, onUnlearn,
   } = props;
+  const [showMemory, setShowMemory] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const learnedCount = (memory?.allow?.length || 0) + (memory?.typos?.length || 0);
 
   const timedIssues = issues.filter(i => i.ts != null);
   const checkCounts = useMemo(() => {
@@ -2577,11 +2775,20 @@ function ResultsStage(props) {
           <button onClick={onNewUpload} style={{ padding: "9px 18px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
             ← Dashboard
           </button>
+          {onUnlearn && (
+            <button onClick={() => setShowMemory((v) => !v)} title="Review what the AI has learned" style={{ padding: "9px 16px", borderRadius: 9, background: showMemory ? T.redTint : "rgba(255,255,255,0.05)", color: showMemory ? T.redLight : T.textMute, fontSize: 12, fontWeight: 700, cursor: "pointer", border: `1px solid ${showMemory ? T.borderHot : T.border}` }}>
+              🧠 Learned {learnedCount > 0 ? `(${learnedCount})` : ""}
+            </button>
+          )}
           <button onClick={onExport} style={{ padding: "9px 18px", borderRadius: 9, background: T.gradient, color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 8px rgba(220,38,38,0.3)" }}>
             ⬇ Export PDF
           </button>
         </div>
       </div>
+
+      {showMemory && onUnlearn && (
+        <MemoryPanel memory={memory} onUnlearn={onUnlearn} onClose={() => setShowMemory(false)} />
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 24 }}>
         <StatCard ring score={overallScore} label="Overall Score" />
@@ -2762,6 +2969,19 @@ function ResultsStage(props) {
 
           {/* Findings list — filtered by tab + secondary filter */}
           <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+            {onAddMissed && activeTab === "qc_technical" && (
+              adding ? (
+                <AddMissedForm defaultTs={currentTs} onAdd={onAddMissed} onClose={() => setAdding(false)} />
+              ) : (
+                <button
+                  onClick={() => setAdding(true)}
+                  title="The AI missed something? Add it here — and it'll watch for it next time"
+                  style={{ alignSelf: "flex-start", padding: "7px 12px", borderRadius: 8, cursor: "pointer", border: `1px dashed ${T.border}`, background: "rgba(255,255,255,0.03)", color: T.textMute, fontSize: 11.5, fontWeight: 700 }}
+                >
+                  ＋ Add missed issue
+                </button>
+              )
+            )}
             {filteredIssues.length === 0 ? (
               <div style={{ padding: "32px 16px", textAlign: "center", color: T.textDim }}>
                 <div style={{ fontSize: 32, marginBottom: 8 }}>
@@ -2782,6 +3002,7 @@ function ResultsStage(props) {
                   onClick={seekToIssue}
                   isDone={doneIds.has(issue.id)}
                   onToggleDone={toggleDone}
+                  onLearnCorrect={onLearnCorrect}
                 />
               ))
             )}
@@ -2955,8 +3176,10 @@ export default function App() {
   const [scanCapMs, setScanCapMs] = useState(0);           // total cap (for the countdown bar)
   const [canResume, setCanResume] = useState(false);       // some segments still pending/failed
   const [doneIds, setDoneIds] = useState(() => new Set()); // issue ids the editor marked complete
+  const [memory, setMemory] = useState(() => loadMemory(loadUser())); // learned corrections (allow + typos)
 
   const fileRef = useRef(null);
+  const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
   const videoRef = useRef(null);
   const abortRef = useRef(null);
   const seekFromExternal = useRef(false);
@@ -2994,12 +3217,12 @@ export default function App() {
   useEffect(() => { if (user) refreshScans(user); /* load history on mount */ }, []); // eslint-disable-line
 
   const handleLogin = useCallback((name) => {
-    storeUser(name); setUser(name); setStage("dashboard"); refreshScans(name);
+    storeUser(name); setUser(name); setMemory(loadMemory(name)); setStage("dashboard"); refreshScans(name);
   }, [refreshScans]);
 
   const handleLogout = useCallback(() => {
     abortRef.current?.abort();
-    clearStoredUser(); setUser(""); setScans([]); setStage("login");
+    clearStoredUser(); setUser(""); setScans([]); setMemory(EMPTY_MEMORY); setStage("login");
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = null;
@@ -3048,7 +3271,9 @@ export default function App() {
     if (!rec) return;
     const f = rec.blob ? new File([rec.blob], rec.fileName, { type: rec.blob.type || "video/mp4" }) : null;
     setFile(f);
-    setIssues(sortByTs(rec.issues || []));
+    // Apply the editor's allow-list retroactively so words learned after this
+    // scan was saved no longer appear when the report is reopened.
+    setIssues(sortByTs(filterAllowlisted(rec.issues || [], loadMemory(user).allow)));
     setVideoDuration(rec.durationSec || 60);
     setBriefWasUsed(!!rec.briefUsed);
     setDoneIds(new Set(rec.doneIds || []));
@@ -3057,7 +3282,7 @@ export default function App() {
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = id;
     setStage("results");
-  }, []);
+  }, [user]);
 
   const deleteScan = useCallback(async (id) => {
     try { await idbDelete(id); } catch { /* ignore */ }
@@ -3083,6 +3308,7 @@ export default function App() {
 
     const briefForThisRun = referenceBrief.trim();
     const captionScope = scopeMode;   // capture the text-scope toggle for this run
+    const memoryForThisRun = loadMemory(user);   // freshest learned corrections for this user
     const cfg = MODES[mode];
     setFile(f);
     setStage("analyzing");
@@ -3121,6 +3347,7 @@ export default function App() {
         brief: briefForThisRun,
         transcript,
         captionScope,                                     // "captions" (default) | "all"
+        memory: memoryForThisRun,                         // editor's learned corrections
         file: f,                                          // kept so we can save the report (incl. blob)
         segments: segFrames.map((fr, i) => ({ id: i, frames: fr, status: "pending", issues: [] })),
         creativeDone: false,
@@ -3163,7 +3390,7 @@ export default function App() {
       console.error("Analysis failed:", e);
       setAnalysisError(e.message || "Analysis failed");
     }
-  }, [referenceBrief, mode, scopeMode, finishRun, persistScan]);
+  }, [referenceBrief, mode, scopeMode, user, finishRun, persistScan]);
 
   // RESUME: re-run ONLY the segments still pending/failed/aborted. Completed
   // segments + their findings are preserved in checkpointRef.
@@ -3295,6 +3522,63 @@ export default function App() {
     exportReportPDF({ fileName: file?.name || "video.mp4", issues, doneIds, durationSec: videoDuration, score: overallScore });
   }, [file, issues, doneIds, videoDuration, overallScore]);
 
+  // ── Learn / correct-on-the-spot (spell-checker-style custom dictionary) ───────
+  // "This is correct" → add the word to the allow-list (never flagged again) and
+  // drop the finding from the current report.
+  const learnCorrect = useCallback((issue, term) => {
+    const t = (term || "").trim();
+    if (!t) return;
+    setMemory((prev) => {
+      if (prev.allow.some((a) => normTerm(a.term) === normTerm(t))) return prev;   // dedupe
+      const next = { ...prev, allow: [...prev.allow, { term: t, ts: Date.now() }] };
+      saveMemory(user, next);
+      return next;
+    });
+    setIssues((prev) => prev.filter((i) => i.id !== issue.id));
+    setSelectedIssue((s) => (s?.id === issue.id ? null : s));
+  }, [user]);
+
+  // "You missed this" → add a manual finding to the report now, AND remember the
+  // wrong→right pair so future scans actively watch for it.
+  const addMissed = useCallback(({ ts, wrong, right, note }) => {
+    const w = (wrong || "").trim(), r = (right || "").trim(), n = (note || "").trim();
+    if (!w && !r && !n) return;
+    const id = manualIdRef.current--;
+    const finding = {
+      id, category: "qc_technical", checkId: "grammar", kind: "spelling",
+      confidence: "high", priority: "required", severity: "error", textSource: "caption",
+      ts: (typeof ts === "number" && isFinite(ts)) ? ts : null,
+      captionText: w || null, audioText: null,
+      msg: r ? `Editor-flagged: “${w}” should be “${r}”` : (w ? `Editor-flagged: “${w}”` : "Editor-flagged issue"),
+      why: n || "Reported by the editor — missed in the automated pass.",
+      fix: r ? `Replace “${w}” with “${r}”` : (n || "See note."),
+      manual: true,
+    };
+    setIssues((prev) => {
+      const nextList = sortByTs([...prev, finding]);
+      const scanId = currentScanIdRef.current;
+      if (scanId) (async () => {
+        try { const rec = await idbGet(scanId); if (rec) { await saveScan({ ...rec, issues: nextList }); if (user) refreshScans(user); } } catch { /* ignore */ }
+      })();
+      return nextList;
+    });
+    if (w && r) setMemory((prev) => {
+      if (prev.typos.some((t) => normTerm(t.wrong) === normTerm(w))) return prev;
+      const next = { ...prev, typos: [...prev.typos, { wrong: w, right: r, ts: Date.now() }] };
+      saveMemory(user, next);
+      return next;
+    });
+  }, [user, refreshScans]);
+
+  // Remove a learned entry ("allow" or "typos") by index.
+  const unlearn = useCallback((kind, idx) => {
+    setMemory((prev) => {
+      const next = { ...prev, [kind]: prev[kind].filter((_, i) => i !== idx) };
+      saveMemory(user, next);
+      return next;
+    });
+  }, [user]);
+
   return (
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
       <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} />
@@ -3394,6 +3678,10 @@ export default function App() {
             doneIds={doneIds}
             toggleDone={toggleDone}
             briefWasUsed={briefWasUsed}
+            memory={memory}
+            onLearnCorrect={learnCorrect}
+            onAddMissed={addMissed}
+            onUnlearn={unlearn}
           />
         )}
       </div>
