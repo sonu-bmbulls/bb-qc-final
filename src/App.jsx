@@ -264,6 +264,8 @@ const SCAN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // reports kept for 7 days
 function loadUser() { try { return localStorage.getItem(USER_KEY) || ""; } catch { return ""; } }
 function storeUser(name) { try { localStorage.setItem(USER_KEY, name); } catch { /* ignore */ } }
 function clearStoredUser() { try { localStorage.removeItem(USER_KEY); } catch { /* ignore */ } }
+// Identity key: "sonu", "Sonu", "SONU", " soNu " all map to the SAME workspace.
+function normalizeUser(name) { return (name || "").trim().replace(/\s+/g, " ").toLowerCase(); }
 
 function fmtDate(ms) {
   try { return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); }
@@ -389,8 +391,9 @@ async function listUserScans(user) {
   try { all = await idbGetAll(); } catch { return []; }
   const cutoff = Date.now() - SCAN_RETENTION_MS;
   for (const r of all) if (r.createdAt < cutoff) { try { await idbDelete(r.id); } catch { /* */ } }
+  const key = normalizeUser(user);
   return all
-    .filter((r) => r.createdAt >= cutoff && r.user === user)
+    .filter((r) => r.createdAt >= cutoff && normalizeUser(r.user) === key)
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
