@@ -380,6 +380,40 @@ function saveMemory(user, mem) {
 function normTerm(s) { return (s || "").trim().toLowerCase(); }
 function reEsc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
+// ── Admin (same-device) ───────────────────────────────────────────────────────
+// Name-based gate, consistent with the name-only login. NOT real security — any
+// device where someone logs in as "sonu" is admin on THAT browser. Harden later
+// with a PIN if needed. Admin sees every scan stored in THIS browser's IndexedDB.
+const ADMIN_USERS = new Set(["sonu"]);
+function isAdmin(user) { return ADMIN_USERS.has(normalizeUser(user)); }
+
+// ── QC feedback log (same-device; localStorage) ───────────────────────────────
+// The model-improvement signal: every admin correction is appended here so QC
+// quality can be reviewed and the glossary/memory tuned over time.
+const FEEDBACK_KEY = "bbqc_feedback";
+const FEEDBACK_LIMIT = 2000;
+const FEEDBACK_TYPES = [
+  { id: "confirmed",       label: "Correct issue",   color: "#10b981" },
+  { id: "false_positive",  label: "False positive",  color: "#ef4444" },
+  { id: "missed",          label: "Missed issue",    color: "#f59e0b" },
+  { id: "wrong_severity",  label: "Wrong severity",  color: "#a855f7" },
+  { id: "wrong_timestamp", label: "Wrong timestamp", color: "#0ea5e9" },
+];
+const FEEDBACK_LABEL = Object.fromEntries(FEEDBACK_TYPES.map((t) => [t.id, t]));
+function loadFeedback() {
+  try { const a = JSON.parse(localStorage.getItem(FEEDBACK_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+}
+function logFeedback(entry) {
+  try {
+    const all = loadFeedback();
+    all.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ts: Date.now(), ...entry });
+    localStorage.setItem(FEEDBACK_KEY, JSON.stringify(all.slice(-FEEDBACK_LIMIT)));
+  } catch { /* ignore quota */ }
+  return loadFeedback();
+}
+function clearFeedback() { try { localStorage.removeItem(FEEDBACK_KEY); } catch { /* ignore */ } }
+
 // Deterministic allow-list guard: should this finding be suppressed because the
 // editor already confirmed the word is correct? CONSERVATIVE on purpose — only
 // touches "is this spelled/written right" kinds (never audio-mismatch / layout /
@@ -531,6 +565,27 @@ async function listUserScans(user) {
   return all
     .filter((r) => r.createdAt >= cutoff && normalizeUser(r.user) === key)
     .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// ADMIN: every scan in THIS browser (all users), newest first. Purges expired.
+async function listAllScans() {
+  let all = [];
+  try { all = await idbGetAll(); } catch { return []; }
+  const cutoff = Date.now() - SCAN_RETENTION_MS;
+  for (const r of all) if (r.createdAt < cutoff) { try { await idbDelete(r.id); } catch { /* */ } }
+  return all.filter((r) => r.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// Pending Required / Optional / Unnecessary counts for a saved report (excludes
+// items the editor already marked done). Derives from the stored issues + doneIds.
+function scanPriorityCounts(rec) {
+  const done = new Set(rec.doneIds || []);
+  const c = { required: 0, optional: 0, ignore: 0, done: 0 };
+  for (const it of rec.issues || []) {
+    if (done.has(it.id)) { c.done++; continue; }
+    c[issuePriority(it)]++;
+  }
+  return c;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2249,9 +2304,13 @@ function Timeline({ issues, currentTs, duration, doneIds, onSeek }) {
   );
 }
 
-function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCorrect }) {
+function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCorrect, onFeedback }) {
   const [learning, setLearning] = useState(false);
   const [term, setTerm] = useState("");
+  const [fbOpen, setFbOpen] = useState(false);
+  const [fbType, setFbType] = useState(null);
+  const [fbNote, setFbNote] = useState("");
+  const [fbSent, setFbSent] = useState(false);
   const s = SEV[issue.severity];
   const check = CHECKS.find(c => c.id === issue.checkId);
   const isCreative = issue.category === "creative_retention";
@@ -2416,11 +2475,48 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
           </div>
         </div>
       )}
+      {onFeedback && !isCreative && (
+        fbSent ? (
+          <p style={{ marginTop: 8, fontSize: 10.5, color: "#34d399", fontWeight: 700 }}>✓ Feedback logged for QC review</p>
+        ) : !fbOpen ? (
+          <button
+            onClick={(e) => { e.stopPropagation(); setFbOpen(true); }}
+            title="Admin: rate this finding to improve QC"
+            style={{ marginTop: 8, padding: "5px 10px", borderRadius: 8, cursor: "pointer", border: `1px dashed ${T.border}`, background: "rgba(255,255,255,0.03)", color: T.textDim, fontSize: 10.5, fontWeight: 700 }}
+          >
+            ⚑ QC feedback
+          </button>
+        ) : (
+          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 8, padding: 10, borderRadius: 8, background: "rgba(168,85,247,0.06)", border: "1px solid rgba(168,85,247,0.3)" }}>
+            <p style={{ fontSize: 10.5, color: T.textDim, marginBottom: 6 }}>Admin feedback — how did QC do on this finding?</p>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+              {FEEDBACK_TYPES.filter((t) => t.id !== "missed").map((t) => (
+                <button key={t.id} onClick={() => setFbType(t.id)}
+                  style={{ padding: "4px 9px", borderRadius: 7, cursor: "pointer", fontSize: 10.5, fontWeight: 700,
+                    color: fbType === t.id ? "#fff" : t.color, background: fbType === t.id ? t.color : `${t.color}1a`,
+                    border: `1px solid ${t.color}66` }}>{t.label}</button>
+              ))}
+            </div>
+            <input value={fbNote} onChange={(e) => setFbNote(e.target.value)} placeholder="Note (optional)"
+              style={{ width: "100%", padding: "6px 10px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: `1px solid ${T.border}`, color: "white", fontSize: 11, outline: "none", marginBottom: 8 }} />
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                onClick={() => { if (fbType) { onFeedback({ type: fbType, issueId: issue.id, caption: issue.captionText, msg: issue.msg, note: fbNote.trim() || null }); setFbSent(true); } }}
+                disabled={!fbType}
+                style={{ padding: "6px 12px", borderRadius: 8, cursor: fbType ? "pointer" : "not-allowed", border: "none", background: fbType ? T.gradientPurple : "rgba(255,255,255,0.06)", color: fbType ? "white" : T.textDim, fontSize: 11, fontWeight: 800 }}
+              >
+                Log feedback
+              </button>
+              <button onClick={() => { setFbOpen(false); setFbType(null); setFbNote(""); }} style={{ padding: "6px 12px", borderRadius: 8, cursor: "pointer", border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11, fontWeight: 700 }}>Cancel</button>
+            </div>
+          </div>
+        )
+      )}
     </div>
   );
 }
 
-function Nav({ apiStatus, user, onLogout }) {
+function Nav({ apiStatus, user, onLogout, isAdminUser, onAdmin }) {
   const dotColor = !apiStatus.probed ? "#94a3b8" : apiStatus.ok ? "#10b981" : T.redBright;
   const dotLabel = !apiStatus.probed ? "Checking API…" : apiStatus.ok ? "API connected" : "API unavailable";
   return (
@@ -2438,6 +2534,9 @@ function Nav({ apiStatus, user, onLogout }) {
             <div style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, boxShadow: `0 0 8px ${dotColor}` }} />
             <span style={{ fontSize: 12, color: T.textMute }}>{dotLabel}</span>
           </div>
+          {user && isAdminUser && onAdmin && (
+            <button onClick={onAdmin} title="Admin · QC monitor (all scans on this device)" style={{ fontSize: 11, fontWeight: 800, color: T.redLight, background: T.redTint, border: `1px solid ${T.borderHot}`, borderRadius: 8, padding: "6px 12px", cursor: "pointer" }}>🛡 Admin</button>
+          )}
           {user && (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <div title={user} style={{ width: 30, height: 30, borderRadius: "50%", background: T.gradientPurple, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, textTransform: "uppercase" }}>{user.slice(0, 1)}</div>
@@ -2932,7 +3031,7 @@ function ResultsStage(props) {
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
     requiredCount, optionalCount, ignoreCount, doneCount,
     overallScore, onNewUpload, onExport, onRecheck, doneIds, toggleDone, briefWasUsed,
-    memory, onLearnCorrect, onAddMissed, onUnlearn,
+    memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback,
   } = props;
   const [showMemory, setShowMemory] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -3198,6 +3297,7 @@ function ResultsStage(props) {
                   isDone={doneIds.has(issue.id)}
                   onToggleDone={toggleDone}
                   onLearnCorrect={onLearnCorrect}
+                  onFeedback={onFeedback}
                 />
               ))
             )}
@@ -3340,6 +3440,182 @@ function DashboardStage({ user, scans, loading, onNewScan, onOpen, onDelete }) {
   );
 }
 
+// ── ADMIN PANEL (same-device) ─────────────────────────────────────────────────
+// Gated to admin users. Reviews every scan stored in THIS browser across all
+// users, and shows the QC-feedback log. Does NOT touch the normal user dashboard.
+function AdminFilterChip({ label, count, active, onClick, color }) {
+  return (
+    <button onClick={onClick} style={{ padding: "7px 13px", borderRadius: 9, cursor: "pointer", fontSize: 12, fontWeight: 700,
+      background: active ? `${color}22` : "rgba(255,255,255,0.04)", color: active ? color : T.textMute,
+      border: `1px solid ${active ? color + "88" : T.border}` }}>
+      {label}{count != null ? ` ${count}` : ""}
+    </button>
+  );
+}
+
+function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback }) {
+  const [tab, setTab] = useState("overview");   // overview | videos | feedback
+  const scans = allScans || [];
+  const fb = feedback || [];
+
+  const users = useMemo(() => {
+    const mem = loadAllMemory();
+    const map = new Map();
+    for (const r of scans) {
+      const key = normalizeUser(r.user);
+      if (!map.has(key)) map.set(key, { key, name: r.user || "—", count: 0, lastAt: 0, required: 0, errors: 0, scoreSum: 0 });
+      const u = map.get(key);
+      u.count++;
+      u.lastAt = Math.max(u.lastAt, r.createdAt || 0);
+      u.required += scanPriorityCounts(r).required;
+      u.errors += r.errors || 0;
+      u.scoreSum += (typeof r.score === "number" ? r.score : 0);
+    }
+    return [...map.values()].map((u) => {
+      const m = mem[u.key] || {};
+      return { ...u, avgScore: u.count ? Math.round(u.scoreSum / u.count) : 0, learned: (m.allow?.length || 0) + (m.typos?.length || 0) };
+    }).sort((a, b) => b.lastAt - a.lastAt);
+  }, [scans]);
+
+  const fbCounts = useMemo(() => { const c = {}; for (const f of fb) c[f.type] = (c[f.type] || 0) + 1; return c; }, [fb]);
+  const fbSorted = useMemo(() => [...fb].sort((a, b) => (b.ts || 0) - (a.ts || 0)), [fb]);
+
+  const th = { textAlign: "left", padding: "10px 12px", borderBottom: `1px solid ${T.border}`, fontWeight: 700, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.04em", color: T.textDim, whiteSpace: "nowrap" };
+  const td = { padding: "10px 12px", borderBottom: `1px solid ${T.border}`, fontSize: 12.5 };
+
+  return (
+    <div className="fade-in" style={{ paddingTop: 8, paddingBottom: 48 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: 22 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: "-0.02em" }}>🛡 Admin · QC Monitor</h1>
+          <p style={{ color: T.textDim, fontSize: 13, marginTop: 4 }}>
+            All scans on <strong style={{ color: "white" }}>this device</strong> · {scans.length} reports · {users.length} users · signed in as <strong style={{ color: "white" }}>{user}</strong>
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onRefresh} style={{ padding: "10px 16px", borderRadius: 10, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 700, cursor: "pointer", border: `1px solid ${T.border}` }}>↻ Refresh</button>
+          <button onClick={onBack} style={{ padding: "10px 16px", borderRadius: 10, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 700, cursor: "pointer", border: `1px solid ${T.border}` }}>← My dashboard</button>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
+        <AdminFilterChip label="👥 Users" count={users.length} active={tab === "overview"} onClick={() => setTab("overview")} color="#ef4444" />
+        <AdminFilterChip label="🎬 Videos" count={scans.length} active={tab === "videos"} onClick={() => setTab("videos")} color="#ef4444" />
+        <AdminFilterChip label="🧠 Feedback" count={fb.length} active={tab === "feedback"} onClick={() => setTab("feedback")} color="#ef4444" />
+      </div>
+
+      {loading ? (
+        <p style={{ color: T.textDim }}>Loading all reports on this device…</p>
+      ) : scans.length === 0 && fb.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "60px 20px", border: `1px dashed ${T.border}`, borderRadius: 16 }}>
+          <div style={{ fontSize: 40, marginBottom: 10 }}>🗂️</div>
+          <p style={{ fontWeight: 700 }}>No reports stored on this device yet</p>
+          <p style={{ color: T.textDim, fontSize: 13, marginTop: 6 }}>Admin only sees scans run in this browser. Reports from other devices aren't visible without a backend.</p>
+        </div>
+      ) : (
+        <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+
+            {tab === "overview" && (
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
+                <thead><tr>
+                  {["User", "Videos", "Last activity", "Pending required", "Total errors", "Avg score", "Learned"].map((h, i) => <th key={i} style={th}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {users.map((u) => (
+                    <tr key={u.key}>
+                      <td style={{ ...td, fontWeight: 700 }}>
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ width: 24, height: 24, borderRadius: "50%", background: T.gradientPurple, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, textTransform: "uppercase" }}>{(u.name || "?").slice(0, 1)}</span>
+                          {u.name}{isAdmin(u.name) && <span style={{ fontSize: 9, color: T.redLight }}>🛡</span>}
+                        </span>
+                      </td>
+                      <td style={td}>{u.count}</td>
+                      <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{u.lastAt ? `${fmtDate(u.lastAt)} ${fmtClock(u.lastAt)}` : "—"}</td>
+                      <td style={{ ...td, color: u.required > 0 ? T.redLight : T.textMute, fontWeight: 700 }}>{u.required}</td>
+                      <td style={{ ...td, color: T.redLight, fontWeight: 700 }}>{u.errors}</td>
+                      <td style={{ ...td, fontWeight: 800, fontFamily: "DM Mono, monospace", color: u.avgScore >= 80 ? "#10b981" : u.avgScore >= 60 ? "#f59e0b" : T.redBright }}>{u.avgScore}</td>
+                      <td style={{ ...td, color: T.textMute }}>{u.learned}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {tab === "videos" && (
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 820 }}>
+                <thead><tr>
+                  {["Video", "User", "Uploaded", "Score", "Req", "Opt", "Unnec", ""].map((h, i) => <th key={i} style={{ ...th, textAlign: i >= 3 && i <= 6 ? "center" : "left" }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {scans.map((r) => {
+                    const c = scanPriorityCounts(r);
+                    return (
+                      <tr key={r.id}>
+                        <td style={{ ...td, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>🎬 {r.fileName}</td>
+                        <td style={{ ...td, color: T.textMute, fontWeight: 700 }}>{r.user || "—"}</td>
+                        <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtDate(r.createdAt)} {fmtClock(r.createdAt)}</td>
+                        <td style={{ ...td, textAlign: "center", fontWeight: 800, fontFamily: "DM Mono, monospace", color: r.score >= 80 ? "#10b981" : r.score >= 60 ? "#f59e0b" : T.redBright }}>{r.score}</td>
+                        <td style={{ ...td, textAlign: "center", color: T.redLight, fontWeight: 700 }}>{c.required}</td>
+                        <td style={{ ...td, textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{c.optional}</td>
+                        <td style={{ ...td, textAlign: "center", color: T.textMute }}>{c.ignore}</td>
+                        <td style={{ ...td, textAlign: "center", whiteSpace: "nowrap" }}>
+                          <button onClick={() => onOpen(r.id)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 11, fontWeight: 700 }}>Open & review</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            {tab === "feedback" && (
+              <div style={{ padding: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+                  {FEEDBACK_TYPES.map((t) => (
+                    <span key={t.id} style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 20, color: t.color, background: `${t.color}1a`, border: `1px solid ${t.color}55` }}>
+                      {t.label}: {fbCounts[t.id] || 0}
+                    </span>
+                  ))}
+                  {fb.length > 0 && (
+                    <button onClick={onClearFeedback} style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11, fontWeight: 700, border: `1px solid ${T.border}` }}>Clear log</button>
+                  )}
+                </div>
+                {fb.length === 0 ? (
+                  <p style={{ color: T.textDim, fontSize: 13, padding: "20px 4px" }}>No feedback yet. Open any report and use the issue feedback buttons (Correct issue / False positive / Wrong severity / Wrong timestamp), or "✗ Not an error" and "＋ Add missed issue" — every correction is logged here as the model-improvement signal.</p>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {fbSorted.map((f) => {
+                      const t = FEEDBACK_LABEL[f.type] || { label: f.type, color: T.textMute };
+                      return (
+                        <div key={f.id} style={{ padding: "10px 12px", borderRadius: 10, background: "rgba(255,255,255,0.02)", border: `1px solid ${T.border}`, borderLeft: `3px solid ${t.color}` }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 4 }}>
+                            <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4, color: t.color, background: `${t.color}1a`, border: `1px solid ${t.color}55` }}>{t.label.toUpperCase()}</span>
+                            {f.ts != null && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "DM Mono, monospace" }}>{fmtDate(f.ts)} {fmtClock(f.ts)}</span>}
+                            <span style={{ fontSize: 11, color: T.textDim }}>by {f.admin || "admin"}{f.owner ? ` · video by ${f.owner}` : ""}</span>
+                            {f.scanId && (
+                              <button onClick={() => onOpen(f.scanId)} style={{ marginLeft: "auto", padding: "4px 10px", borderRadius: 7, cursor: "pointer", background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 10.5, fontWeight: 700, border: `1px solid ${T.border}` }}>Open report</button>
+                            )}
+                          </div>
+                          {f.caption && <p style={{ fontSize: 12, margin: "2px 0" }}><span style={{ color: T.textDim }}>Caption: </span>“{f.caption}”</p>}
+                          {f.msg && <p style={{ fontSize: 12, margin: "2px 0", color: "rgba(255,255,255,0.85)" }}>{f.msg}</p>}
+                          {f.note && <p style={{ fontSize: 11.5, margin: "2px 0", color: T.textMute }}><span style={{ color: T.textDim }}>Note: </span>{f.note}</p>}
+                          {f.fileName && <p style={{ fontSize: 10.5, margin: "2px 0", color: T.textDim }}>🎬 {f.fileName}</p>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 5. MAIN APP
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3372,9 +3648,13 @@ export default function App() {
   const [canResume, setCanResume] = useState(false);       // some segments still pending/failed
   const [doneIds, setDoneIds] = useState(() => new Set()); // issue ids the editor marked complete
   const [memory, setMemory] = useState(() => loadMemory(loadUser())); // learned corrections (allow + typos)
+  const [allScans, setAllScans] = useState([]);            // ADMIN: every scan in this browser
+  const [feedback, setFeedback] = useState(loadFeedback);  // ADMIN: QC-feedback log
+  const admin = isAdmin(user);
 
   const fileRef = useRef(null);
   const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
+  const reviewCtxRef = useRef(null);                       // {scanId, owner, fileName} of the report being reviewed
   const videoRef = useRef(null);
   const abortRef = useRef(null);
   const seekFromExternal = useRef(false);
@@ -3486,6 +3766,7 @@ export default function App() {
     setActiveTab("qc_technical"); setActiveFilter("required");
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = id;
+    reviewCtxRef.current = { scanId: id, owner: rec.user || "", fileName: rec.fileName || "" };
     setStage("results");
   }, [user]);
 
@@ -3493,6 +3774,31 @@ export default function App() {
     try { await idbDelete(id); } catch { /* ignore */ }
     if (user) refreshScans(user);
   }, [user, refreshScans]);
+
+  // ── Admin: open the panel (loads every scan on this device + the feedback log)
+  const openAdmin = useCallback(async () => {
+    abortRef.current?.abort();
+    setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
+    checkpointRef.current = null; currentScanIdRef.current = null;
+    setFeedback(loadFeedback());
+    setStage("admin");
+    setDashLoading(true);
+    try { setAllScans(await listAllScans()); } finally { setDashLoading(false); }
+  }, []);
+
+  // ── Admin: record a QC-feedback entry (the model-improvement signal).
+  const recordFeedback = useCallback((entry) => {
+    const ctx = reviewCtxRef.current || {};
+    setFeedback(logFeedback({
+      admin: user,
+      scanId: entry.scanId ?? currentScanIdRef.current ?? ctx.scanId ?? null,
+      owner: entry.owner ?? ctx.owner ?? null,
+      fileName: entry.fileName ?? ctx.fileName ?? file?.name ?? null,
+      ...entry,
+    }));
+  }, [user, file]);
+
+  const clearFeedbackLog = useCallback(() => { clearFeedback(); setFeedback([]); }, []);
 
   // Shared post-run handling: surface incomplete coverage + offer Resume.
   const finishRun = useCallback((result) => {
@@ -3741,7 +4047,8 @@ export default function App() {
     });
     setIssues((prev) => prev.filter((i) => i.id !== issue.id));
     setSelectedIssue((s) => (s?.id === issue.id ? null : s));
-  }, [user]);
+    if (admin) recordFeedback({ type: "false_positive", caption: issue.captionText, msg: issue.msg, note: `Learned correct: "${t}"` });
+  }, [user, admin, recordFeedback]);
 
   // "You missed this" → add a manual finding to the report now, AND remember the
   // wrong→right pair so future scans actively watch for it.
@@ -3773,7 +4080,8 @@ export default function App() {
       saveMemory(user, next);
       return next;
     });
-  }, [user, refreshScans]);
+    if (admin) recordFeedback({ type: "missed", caption: w || null, msg: finding.msg, note: n || null });
+  }, [user, admin, refreshScans, recordFeedback]);
 
   // Remove a learned entry ("allow" or "typos") by index.
   const unlearn = useCallback((kind, idx) => {
@@ -3786,7 +4094,7 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
-      <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} />
+      <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} isAdminUser={admin} onAdmin={openAdmin} />
       <div style={{ maxWidth: 1480, margin: "0 auto", padding: "24px" }}>
         {stage === "login" && <LoginStage onLogin={handleLogin} />}
         {stage === "dashboard" && (
@@ -3888,6 +4196,19 @@ export default function App() {
             onLearnCorrect={learnCorrect}
             onAddMissed={addMissed}
             onUnlearn={unlearn}
+            onFeedback={admin ? recordFeedback : null}
+          />
+        )}
+        {stage === "admin" && admin && (
+          <AdminStage
+            user={user}
+            allScans={allScans}
+            feedback={feedback}
+            loading={dashLoading}
+            onOpen={openScan}
+            onBack={goDashboard}
+            onRefresh={openAdmin}
+            onClearFeedback={clearFeedbackLog}
           />
         )}
       </div>
