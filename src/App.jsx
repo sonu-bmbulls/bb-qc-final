@@ -108,6 +108,13 @@ const VERIFY_FORWARD_SEC = 6;     // seconds AHEAD to look — captions reveal p
                                   // the voiceover, so the "missing" text often appears a few
                                   // seconds later; we must look far enough ahead to see it
 
+// ── Review playback ───────────────────────────────────────────────────────────
+// Clicking an issue lands this many seconds BEFORE the flagged frame (then plays)
+// so the reviewer gets lead-in context — caption animation + audio — instead of
+// landing exactly on the (possibly mid-animation) error frame. ~0.6s ≈ 3–5 frames
+// at 24–30fps, within the requested 0.5–1s window.
+const ISSUE_PREROLL_SEC = 0.6;
+
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
 // Per-mode $/1M pricing lives on each MODE above.
@@ -3655,6 +3662,7 @@ export default function App() {
   const fileRef = useRef(null);
   const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
   const reviewCtxRef = useRef(null);                       // {scanId, owner, fileName} of the report being reviewed
+  const wantPlayRef = useRef(false);                       // play from the pre-roll point after an issue click
   const videoRef = useRef(null);
   const abortRef = useRef(null);
   const seekFromExternal = useRef(false);
@@ -3676,6 +3684,12 @@ export default function App() {
     if (Math.abs(v.currentTime - currentTs) > 0.3) {
       seekFromExternal.current = true;
       v.currentTime = currentTs;
+    }
+    // After an issue click we pre-rolled the playhead — now start playback so the
+    // reviewer gets moving context into the error (user-gesture initiated → allowed).
+    if (wantPlayRef.current) {
+      wantPlayRef.current = false;
+      v.play?.().catch(() => { /* autoplay blocked — playhead is still pre-rolled */ });
     }
   }, [currentTs]);
 
@@ -3978,7 +3992,13 @@ export default function App() {
 
   const seekToIssue = (issue) => {
     setSelectedIssue(issue);
-    if (issue.ts != null) setCurrentTs(issue.ts);
+    // Pre-roll: land ~0.6s BEFORE the flagged frame and start playing, so the
+    // reviewer sees the caption animate in and hears the lead-in audio context
+    // rather than jumping onto the exact (possibly mid-animation) error frame.
+    if (issue.ts != null) {
+      wantPlayRef.current = true;
+      setCurrentTs(Math.max(0, issue.ts - ISSUE_PREROLL_SEC));
+    }
     // If the user clicked a timeline marker for a finding in the OTHER tab,
     // switch to that tab so the highlighted issue card is actually visible.
     if (issue.category && issue.category !== activeTab) {
