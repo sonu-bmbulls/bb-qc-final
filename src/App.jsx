@@ -163,6 +163,54 @@ function issuePriority(it) {
   return "ignore";
 }
 
+// ── Three-tier classification (the report's primary axis) ─────────────────────
+//   mistake — confirmed, must-fix (spelling/typo, trading term, brand, meaning-
+//             changing wrong word). Only these affect the score.
+//   review  — AI is NOT sure: uncertain audio mismatch, progressive caption
+//             split, OCR misread of stylized text, medium/low confidence.
+//   style   — client/editor choice: capitalization, all-caps vs Title Case,
+//             lowercase Hinglish openings, romanization variants, consistency.
+const VALID_TIER = new Set(["mistake", "review", "style"]);
+const TIER = {
+  mistake: { label: "Actual Mistake",  short: "MISTAKE", color: "#ef4444" },
+  review:  { label: "Needs Review",    short: "REVIEW",  color: "#f59e0b" },
+  style:   { label: "Optional Style",  short: "STYLE",   color: "#94a3b8" },
+};
+// Capitalization / case / opening-word findings are STYLE, never a hard mistake.
+function isCapitalizationFinding(it) {
+  if (it && it.kind === "caps") return true;
+  const m = `${it?.msg || ""} ${it?.why || ""}`.toLowerCase();
+  return /capitaliz|capital letter|uppercase|lower ?case|all[- ]?caps|title case|sentence case|opening word|first word .*(capital|upper|lower)|should be capitalized|styling( treatment)?/.test(m);
+}
+// Single source of truth for a finding's tier. Works with OR without it.tier
+// (so older saved reports re-sort correctly). Deterministic overrides win over
+// the model's own tier so the user's specific complaints are always honored.
+function issueTier(it) {
+  if (!it) return "review";
+  if (it.category === "creative_retention") return it.tier && VALID_TIER.has(it.tier) ? it.tier : "review";
+  // 1) STYLE — capitalization, romanization variants, consistency, pure style
+  if (it.kind === "consistency") return "style";
+  if (isCapitalizationFinding(it)) return "style";
+  if (isStyleVariant(it)) return "style";
+  if (it.priority === "ignore") return "style";
+  // 2) MISTAKE — a confirmed trading-term error always counts
+  if (matchTradingTerm(it.captionText, `${it.msg || ""} ${it.fix || ""}`)) return "mistake";
+  // 3) REVIEW — anything uncertain
+  if (isOcrSuspect(it)) return "review";
+  if (it.kind === "audio_mismatch") {
+    const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
+    const uncertain = /missing|incomplete|omit|not spoken|does ?n.?t|word order|already shown|extra |only the|unclear/.test(m);
+    return (uncertain || it.confidence !== "high") ? "review" : "mistake";
+  }
+  if (it.confidence === "low" || it.confidence === "medium") return "review";
+  // 4) honor an explicit model tier of review/style if it set one
+  if (it.tier === "review" || it.tier === "style") return it.tier;
+  // 5) default — a high-confidence objective defect is a mistake
+  if (it.priority === "required" || it.severity === "error") return "mistake";
+  return "review";
+}
+const TIER_ORDER = { mistake: 0, review: 1, style: 2 };
+
 // ── Devanagari scrubber ───────────────────────────────────────────────────────
 // Output is LATIN HINGLISH ONLY, but Devanagari occasionally leaks into a field
 // (most often audioText, e.g. "ऑफिशियल कन्फर्मेशन नहीं की है (official ... hai)").
@@ -498,23 +546,22 @@ async function saveScan(rec) {
 
 // Export the report as a print-ready page (user saves as PDF). Opens a SEPARATE
 // window with its own clean stylesheet — the live web report is never touched.
-// Issues are ordered pending-first, then Required → Optional → Unnecessary.
+// Issues are ordered pending-first, then Mistake → Needs Review → Optional Style.
 function exportReportPDF({ fileName, issues, doneIds, durationSec, score }) {
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const done = doneIds || new Set();
-  const counts = { required: 0, optional: 0, ignore: 0, done: 0 };
-  for (const i of issues) { if (done.has(i.id)) counts.done++; else counts[issuePriority(i)]++; }
-  const order = { required: 0, optional: 1, ignore: 2 };
+  const counts = { mistake: 0, review: 0, style: 0, done: 0 };
+  for (const i of issues) { if (done.has(i.id)) counts.done++; else counts[issueTier(i)]++; }
   const rows = [...issues].sort((a, b) => {
     const da = done.has(a.id) ? 1 : 0, db = done.has(b.id) ? 1 : 0;
     if (da !== db) return da - db;                                  // pending first
-    const pa = order[issuePriority(a)], pb = order[issuePriority(b)];
-    if (pa !== pb) return pa - pb;                                  // required → optional → ignore
+    const pa = TIER_ORDER[issueTier(a)], pb = TIER_ORDER[issueTier(b)];
+    if (pa !== pb) return pa - pb;                                  // mistake → review → style
     return (a.ts ?? 1e9) - (b.ts ?? 1e9);
   }).map((i) => {
-    const pr = issuePriority(i), isDone = done.has(i.id);
-    const status = isDone ? "DONE" : pr === "required" ? "REQUIRED" : pr === "optional" ? "OPTIONAL" : "IGNORE";
-    const col = isDone ? "#16a34a" : PRIORITY[pr].color;
+    const t = issueTier(i), isDone = done.has(i.id);
+    const status = isDone ? "DONE" : TIER[t].short;
+    const col = isDone ? "#16a34a" : TIER[t].color;
     return `<tr class="${isDone ? "done" : ""}">
       <td class="ts">${esc(fmtTs(i.ts))}</td>
       <td><span class="pill" style="background:${col}22;color:${col};border:1px solid ${col}66">${status}</span></td>
@@ -548,9 +595,9 @@ function exportReportPDF({ fileName, issues, doneIds, durationSec, score }) {
     <div class="meta">${esc(fileName)} · ${esc(fmtTs(durationSec))} · ${issues.length} findings · generated ${new Date().toLocaleString()}</div>
     <div class="cards">
       <div class="card"><div class="n">${score}</div><div class="l">Score</div></div>
-      <div class="card"><div class="n" style="color:#ef4444">${counts.required}</div><div class="l">Required</div></div>
-      <div class="card"><div class="n" style="color:#f59e0b">${counts.optional}</div><div class="l">Optional</div></div>
-      <div class="card"><div class="n" style="color:#94a3b8">${counts.ignore}</div><div class="l">Unnecessary</div></div>
+      <div class="card"><div class="n" style="color:#ef4444">${counts.mistake}</div><div class="l">Actual Mistakes</div></div>
+      <div class="card"><div class="n" style="color:#f59e0b">${counts.review}</div><div class="l">Needs Review</div></div>
+      <div class="card"><div class="n" style="color:#94a3b8">${counts.style}</div><div class="l">Optional Style</div></div>
       <div class="card"><div class="n" style="color:#16a34a">${counts.done}</div><div class="l">Done</div></div>
     </div>
     <table><thead><tr><th>Time</th><th>Status</th><th>Issue</th></tr></thead><tbody>${rows}</tbody></table>
@@ -583,14 +630,15 @@ async function listAllScans() {
   return all.filter((r) => r.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt);
 }
 
-// Pending Required / Optional / Unnecessary counts for a saved report (excludes
-// items the editor already marked done). Derives from the stored issues + doneIds.
-function scanPriorityCounts(rec) {
+// Pending Mistake / Review / Style counts for a saved report (excludes items the
+// editor already marked done). Derives from the stored issues + doneIds via the
+// tier classifier, so older reports re-sort into the new tiers automatically.
+function scanTierCounts(rec) {
   const done = new Set(rec.doneIds || []);
-  const c = { required: 0, optional: 0, ignore: 0, done: 0 };
+  const c = { mistake: 0, review: 0, style: 0, done: 0 };
   for (const it of rec.issues || []) {
     if (done.has(it.id)) { c.done++; continue; }
-    c[issuePriority(it)]++;
+    c[issueTier(it)]++;
   }
   return c;
 }
@@ -1402,6 +1450,42 @@ be STRICT to avoid noise):
   These are "optional" at most (often "ignore"). Reserve "required" for things
   that genuinely break meaning or readability (mazboor/mazboot, hai/hain, wrong
   price/name, a misspelling that yields a non-word).
+
+═══════════════════════════════════════════════════════════════════════════
+THREE-TIER CLASSIFICATION — SORT EVERY FINDING (READ CAREFULLY)
+═══════════════════════════════════════════════════════════════════════════
+The report sorts findings into three tiers. Encode the tier through "priority"
+and "confidence" exactly as below so the finding lands in the right section:
+
+  TIER 1 — ACTUAL MISTAKE  → priority "required", confidence "high"
+    Confirmed, must-fix, defensible: a real spelling typo, a wrong trading term
+    (BREAK OUT→BREAKOUT), a brand-name error (Anademy→Academy), an incomplete/
+    misspelled word, or a wrong word that CHANGES MEANING. Only use this when you
+    are genuinely sure.
+
+  TIER 2 — NEEDS REVIEW    → confidence "medium" or "low" (priority "optional")
+    You are NOT fully sure. Use this for: ANY audio mismatch you cannot be 100%
+    certain of (the word might have been spoken, e.g. "balki"); a caption that
+    might just be one frame of a PROGRESSIVE reveal; stylized/blurry text the OCR
+    might have misread. When in doubt between Mistake and Review, choose REVIEW.
+
+  TIER 3 — OPTIONAL STYLE  → priority "optional" or "ignore"
+    Editor/client choice, never a hard error: capitalization, ALL-CAPS vs Title
+    Case, a lowercase opening word, romanization variants, stylistic consistency.
+
+CAPITALIZATION & CASE ARE STYLE — NOT ERRORS:
+  • Do NOT flag a word for being ALL-CAPS, for not matching another word's case,
+    or for a lowercase opening (ek / toh / aur / lekin / ko / ke). Short-form
+    Hinglish captions routinely open lowercase and use all-caps titles by design.
+  • Judge the video's OWN style: if titles are all-caps throughout, all-caps is
+    CORRECT. If you mention capitalization at all, it is TIER 3 (never required).
+
+AUDIO MISMATCH = MOSTLY "NEEDS REVIEW":
+  • A caption shows ONE moment of a line that reveals progressively across frames;
+    the rest appears in other frames. NEVER flag "missing"/"incomplete"/"omits".
+  • Flag ONLY a clearly WRONG, visible, meaning-changing substituted word. If you
+    are not certain the wrong word is actually on screen (ASR is imperfect), use
+    confidence "medium" so it goes to Needs Review — do NOT assert a hard mistake.
 
 MINIMALISM — DO NOT ADD NOISE (this is critical):
   • NEVER emit a finding just to say something is CORRECT or needs "no change"
@@ -2321,8 +2405,8 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
   const s = SEV[issue.severity];
   const check = CHECKS.find(c => c.id === issue.checkId);
   const isCreative = issue.category === "creative_retention";
-  const priority = issuePriority(issue);
-  const pr = PRIORITY[priority];
+  const tier = issueTier(issue);
+  const tr = TIER[tier] || TIER.review;
   // Creative cards get a purple left-stripe; completed items go green + dimmed.
   const stripeColor = isDone ? "#10b981" : isCreative ? T.purpleBright : s.dot;
   const selectedBorder = isCreative ? T.purpleBright + "60" : s.dot + "60";
@@ -2385,8 +2469,8 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
           </span>
         )}
         {!isCreative && (
-          <span title={`${pr.label} priority`} style={{ fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: pr.color, background: `${pr.color}1a`, border: `1px solid ${pr.color}55` }}>
-            {pr.short}
+          <span title={tr.label} style={{ fontSize: 8.5, padding: "2px 6px", borderRadius: 4, fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: tr.color, background: `${tr.color}1a`, border: `1px solid ${tr.color}55` }}>
+            {tr.short}
           </span>
         )}
         {!isCreative && issue.textSource === "visual" && (
@@ -3036,7 +3120,7 @@ function ResultsStage(props) {
     issues, filteredIssues, activeFilter, setActiveFilter,
     activeTab, setActiveTab,
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
-    requiredCount, optionalCount, ignoreCount, doneCount,
+    mistakeCount, reviewCount, styleCount, doneCount,
     overallScore, onNewUpload, onExport, onRecheck, doneIds, toggleDone, briefWasUsed,
     memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback,
   } = props;
@@ -3093,9 +3177,9 @@ function ResultsStage(props) {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 24 }}>
         <StatCard ring score={overallScore} label="Overall Score" />
-        <StatCard value={requiredCount} label="Required" color={T.redBright} />
-        <StatCard value={optionalCount} label="Optional" color="#f59e0b" />
-        <StatCard value={ignoreCount} label="Unnecessary" color="#94a3b8" />
+        <StatCard value={mistakeCount} label="Actual Mistakes" color={T.redBright} />
+        <StatCard value={reviewCount} label="Needs Review" color="#f59e0b" />
+        <StatCard value={styleCount} label="Optional Style" color="#94a3b8" />
         <StatCard value={doneCount} label="Done" color="#10b981" />
       </div>
 
@@ -3208,7 +3292,7 @@ function ResultsStage(props) {
               return (
                 <button
                   key={catId}
-                  onClick={() => { setActiveTab(catId); setActiveFilter(catId === "qc_technical" ? "required" : "all"); }}
+                  onClick={() => { setActiveTab(catId); setActiveFilter(catId === "qc_technical" ? "mistake" : "all"); }}
                   style={{
                     flex: 1,
                     padding: "14px 16px",
@@ -3248,18 +3332,18 @@ function ResultsStage(props) {
             </p>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {(() => {
-                // Priority counts within the active tab (pending = not done).
+                // Tier counts within the active tab (pending = not done).
                 const inTab = issues.filter(i => i.category === activeTab);
                 const pend = inTab.filter(i => !doneIds.has(i.id));
-                const req = pend.filter(i => issuePriority(i) === "required").length;
-                const opt = pend.filter(i => issuePriority(i) === "optional").length;
-                const ign = pend.filter(i => issuePriority(i) === "ignore").length;
+                const mis = pend.filter(i => issueTier(i) === "mistake").length;
+                const rev = pend.filter(i => issueTier(i) === "review").length;
+                const sty = pend.filter(i => issueTier(i) === "style").length;
                 const dn = inTab.filter(i => doneIds.has(i.id)).length;
                 return (
                   <>
-                    <FilterChip label="Required" count={req} active={activeFilter === "required"} onClick={() => setActiveFilter("required")} color={T.redBright} />
-                    <FilterChip label="Optional" count={opt} active={activeFilter === "optional"} onClick={() => setActiveFilter("optional")} color="#f59e0b" />
-                    <FilterChip label="Unnecessary" count={ign} active={activeFilter === "unnecessary"} onClick={() => setActiveFilter("unnecessary")} color="#94a3b8" />
+                    <FilterChip label="Actual Mistakes" count={mis} active={activeFilter === "mistake"} onClick={() => setActiveFilter("mistake")} color={T.redBright} />
+                    <FilterChip label="Needs Review" count={rev} active={activeFilter === "review"} onClick={() => setActiveFilter("review")} color="#f59e0b" />
+                    <FilterChip label="Optional Style" count={sty} active={activeFilter === "style"} onClick={() => setActiveFilter("style")} color="#94a3b8" />
                     <FilterChip label="Done" count={dn} active={activeFilter === "done"} onClick={() => setActiveFilter("done")} color="#10b981" />
                     <FilterChip label="All pending" count={pend.length} active={activeFilter === "all"} onClick={() => setActiveFilter("all")} color={CATEGORIES[activeTab].accent} />
                   </>
@@ -3470,11 +3554,11 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
     const map = new Map();
     for (const r of scans) {
       const key = normalizeUser(r.user);
-      if (!map.has(key)) map.set(key, { key, name: r.user || "—", count: 0, lastAt: 0, required: 0, errors: 0, scoreSum: 0 });
+      if (!map.has(key)) map.set(key, { key, name: r.user || "—", count: 0, lastAt: 0, mistakes: 0, errors: 0, scoreSum: 0 });
       const u = map.get(key);
       u.count++;
       u.lastAt = Math.max(u.lastAt, r.createdAt || 0);
-      u.required += scanPriorityCounts(r).required;
+      u.mistakes += scanTierCounts(r).mistake;
       u.errors += r.errors || 0;
       u.scoreSum += (typeof r.score === "number" ? r.score : 0);
     }
@@ -3526,7 +3610,7 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
             {tab === "overview" && (
               <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
                 <thead><tr>
-                  {["User", "Videos", "Last activity", "Pending required", "Total errors", "Avg score", "Learned"].map((h, i) => <th key={i} style={th}>{h}</th>)}
+                  {["User", "Videos", "Last activity", "Pending mistakes", "Total errors", "Avg score", "Learned"].map((h, i) => <th key={i} style={th}>{h}</th>)}
                 </tr></thead>
                 <tbody>
                   {users.map((u) => (
@@ -3539,7 +3623,7 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
                       </td>
                       <td style={td}>{u.count}</td>
                       <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{u.lastAt ? `${fmtDate(u.lastAt)} ${fmtClock(u.lastAt)}` : "—"}</td>
-                      <td style={{ ...td, color: u.required > 0 ? T.redLight : T.textMute, fontWeight: 700 }}>{u.required}</td>
+                      <td style={{ ...td, color: u.mistakes > 0 ? T.redLight : T.textMute, fontWeight: 700 }}>{u.mistakes}</td>
                       <td style={{ ...td, color: T.redLight, fontWeight: 700 }}>{u.errors}</td>
                       <td style={{ ...td, fontWeight: 800, fontFamily: "DM Mono, monospace", color: u.avgScore >= 80 ? "#10b981" : u.avgScore >= 60 ? "#f59e0b" : T.redBright }}>{u.avgScore}</td>
                       <td style={{ ...td, color: T.textMute }}>{u.learned}</td>
@@ -3552,20 +3636,20 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
             {tab === "videos" && (
               <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 820 }}>
                 <thead><tr>
-                  {["Video", "User", "Uploaded", "Score", "Req", "Opt", "Unnec", ""].map((h, i) => <th key={i} style={{ ...th, textAlign: i >= 3 && i <= 6 ? "center" : "left" }}>{h}</th>)}
+                  {["Video", "User", "Uploaded", "Score", "Mistake", "Review", "Style", ""].map((h, i) => <th key={i} style={{ ...th, textAlign: i >= 3 && i <= 6 ? "center" : "left" }}>{h}</th>)}
                 </tr></thead>
                 <tbody>
                   {scans.map((r) => {
-                    const c = scanPriorityCounts(r);
+                    const c = scanTierCounts(r);
                     return (
                       <tr key={r.id}>
                         <td style={{ ...td, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>🎬 {r.fileName}</td>
                         <td style={{ ...td, color: T.textMute, fontWeight: 700 }}>{r.user || "—"}</td>
                         <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtDate(r.createdAt)} {fmtClock(r.createdAt)}</td>
                         <td style={{ ...td, textAlign: "center", fontWeight: 800, fontFamily: "DM Mono, monospace", color: r.score >= 80 ? "#10b981" : r.score >= 60 ? "#f59e0b" : T.redBright }}>{r.score}</td>
-                        <td style={{ ...td, textAlign: "center", color: T.redLight, fontWeight: 700 }}>{c.required}</td>
-                        <td style={{ ...td, textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{c.optional}</td>
-                        <td style={{ ...td, textAlign: "center", color: T.textMute }}>{c.ignore}</td>
+                        <td style={{ ...td, textAlign: "center", color: T.redLight, fontWeight: 700 }}>{c.mistake}</td>
+                        <td style={{ ...td, textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{c.review}</td>
+                        <td style={{ ...td, textAlign: "center", color: T.textMute }}>{c.style}</td>
                         <td style={{ ...td, textAlign: "center", whiteSpace: "nowrap" }}>
                           <button onClick={() => onOpen(r.id)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 11, fontWeight: 700 }}>Open & review</button>
                         </td>
@@ -3642,7 +3726,7 @@ export default function App() {
   const [videoDuration, setVideoDuration] = useState(60);
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [currentTs, setCurrentTs] = useState(null);
-  const [activeFilter, setActiveFilter] = useState("required"); // required|optional|unnecessary|done|all
+  const [activeFilter, setActiveFilter] = useState("mistake"); // mistake|review|style|done|all
   const [activeTab, setActiveTab] = useState("qc_technical"); // qc_technical | creative_retention
   const [apiStatus, setApiStatus] = useState({ probed: false, ok: false, detail: "" });
   const [referenceBrief, setReferenceBrief] = useState("");
@@ -3777,7 +3861,7 @@ export default function App() {
     setBriefWasUsed(!!rec.briefUsed);
     setDoneIds(new Set(rec.doneIds || []));
     setSelectedIssue(null); setCurrentTs(null);
-    setActiveTab("qc_technical"); setActiveFilter("required");
+    setActiveTab("qc_technical"); setActiveFilter("mistake");
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = id;
     reviewCtxRef.current = { scanId: id, owner: rec.user || "", fileName: rec.fileName || "" };
@@ -3842,7 +3926,7 @@ export default function App() {
     setCurrentTs(null);
     setAnalysisError(null);
     setAnalysisWarning(null);
-    setActiveFilter("required");
+    setActiveFilter("mistake");
     setCanResume(false);
     setDoneIds(new Set());
     setBriefWasUsed(briefForThisRun.length > 0);
@@ -4018,19 +4102,19 @@ export default function App() {
 
   // Counts + score by IMPORTANCE (not raw severity), so optional/unnecessary
   // items don't tank the score. Done items don't count against it.
-  const requiredCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "required").length;
-  const optionalCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "optional").length;
-  const ignoreCount = issues.filter(i => !doneIds.has(i.id) && issuePriority(i) === "ignore").length;
+  // Three-tier counts (pending = not done). Only Actual Mistakes affect the score.
+  const mistakeCount = issues.filter(i => !doneIds.has(i.id) && issueTier(i) === "mistake").length;
+  const reviewCount  = issues.filter(i => !doneIds.has(i.id) && issueTier(i) === "review").length;
+  const styleCount   = issues.filter(i => !doneIds.has(i.id) && issueTier(i) === "style").length;
   const doneCount = issues.filter(i => doneIds.has(i.id)).length;
-  const overallScore = Math.max(0, Math.min(100, 100 - requiredCount * 12 - optionalCount * 3));
+  const overallScore = Math.max(0, Math.min(100, 100 - mistakeCount * 12));
 
   const filteredIssues = useMemo(() => {
     let list = issues.filter(i => i.category === activeTab);
     if (activeFilter === "done") return list.filter(i => doneIds.has(i.id));
     list = list.filter(i => !doneIds.has(i.id));              // hide completed from the working views
     if (activeFilter === "all") return list;
-    const want = activeFilter === "unnecessary" ? "ignore" : activeFilter; // required | optional | ignore
-    return list.filter(i => issuePriority(i) === want);
+    return list.filter(i => issueTier(i) === activeFilter);   // mistake | review | style
   }, [issues, activeTab, activeFilter, doneIds]);
 
   // Mark an issue complete (or reopen it) and persist done-state to the report.
@@ -4201,9 +4285,9 @@ export default function App() {
             selectedIssue={selectedIssue}
             seekToIssue={seekToIssue}
             navigateIssue={navigateIssue}
-            requiredCount={requiredCount}
-            optionalCount={optionalCount}
-            ignoreCount={ignoreCount}
+            mistakeCount={mistakeCount}
+            reviewCount={reviewCount}
+            styleCount={styleCount}
             doneCount={doneCount}
             overallScore={overallScore}
             onNewUpload={goDashboard}
