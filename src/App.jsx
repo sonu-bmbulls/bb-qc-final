@@ -191,6 +191,48 @@ function isStyleVariant(it) {
   return /\bvariant\b|non[- ]standard|informal|stylistic|romaniz|abbreviat|missing vowel|double[- ]letter|single[- ]e\b|one word|single word|compound word|two words|split by a space|should be joined|word segmentation/i.test(m);
 }
 
+// ── Trading-domain glossary ───────────────────────────────────────────────────
+// This is a trading-EDUCATION brand: terms like "breakout" are core vocabulary,
+// not generic words, so a split / joined / mis-hyphenated trading term is a
+// REQUIRED brand-accuracy fix — never optional. Used two ways:
+//   1. injected into the prompt so the model knows the domain vocabulary; and
+//   2. a deterministic ESCALATOR (matchTradingTerm) that forces a matched finding
+//      to "required", overriding the style-variant downgrade — so these are caught
+//      CONSISTENTLY, not at the model's run-to-run discretion.
+// `bad` = wrong forms seen in captions; `good` = the canonical/approved spelling.
+const TRADING_TERMS = [
+  { good: "BREAKOUT",     bad: ["break out"] },
+  { good: "BREAKDOWN",    bad: ["break down"] },
+  { good: "FAKEOUT",      bad: ["fake out"] },
+  { good: "PULLBACK",     bad: ["pull back"] },
+  { good: "RETEST",       bad: ["re test", "re-test"] },
+  { good: "TRENDLINE",    bad: ["trend line"] },
+  { good: "CANDLESTICK",  bad: ["candle stick"] },
+  { good: "N-SHAPE",      bad: ["n shape", "n=shape", "n =shape", "n= shape"] },
+];
+// Flat vocabulary the model must treat as KNOWN-correct domain terms — it must
+// NOT "fix" one of these when it is already spelled correctly.
+const TRADING_VOCAB = [
+  "breakout", "breakdown", "fakeout", "pullback", "retest", "trendline",
+  "candlestick", "candle", "wick", "support", "resistance", "entry", "target",
+  "stoploss", "scalping", "swing", "price action", "N-SHAPE pattern", "PE", "CE",
+];
+// Returns the canonical term object when a finding is about a WRONG trading-term
+// form — the bad form is visible in the caption AND the fix/headline proposes the
+// canonical one (so a legit verb phrase like "break out of the range", with no
+// "breakout" correction, does NOT escalate). Else null.
+function matchTradingTerm(captionText, correctionText) {
+  const cap = ` ${(captionText || "").toLowerCase().replace(/\s+/g, " ")} `;
+  const corr = (correctionText || "").toLowerCase().replace(/\s+/g, " ");
+  for (const t of TRADING_TERMS) {
+    for (const b of t.bad) {
+      const re = new RegExp(`(^|[^a-z0-9])${reEsc(b.toLowerCase())}([^a-z0-9]|$)`, "i");
+      if (re.test(cap) && corr.includes(t.good.toLowerCase())) return t;
+    }
+  }
+  return null;
+}
+
 const T = {
   bg:        "#0a0608",
   bgPanel:   "rgba(255,255,255,0.025)",
@@ -891,7 +933,10 @@ ${audioText}` : ""}`,
 
   // ── STATIC instruction block (cached) ───────────────────────────────────────
   // Identical bytes on every call → prompt-cache hit after the first write
-  // (req #4). NO per-call variables in here.
+  // (req #4). NO per-call variables in here. (The glossary lines below are built
+  // from module-level constants, so the bytes are still identical every call.)
+  const tradingRules = TRADING_TERMS.map((t) => `  • "${t.bad.join('" / "')}" → "${t.good}"`).join("\n");
+  const tradingVocabLine = TRADING_VOCAB.join(", ");
   const systemText = `You are an eagle-eyed Post-Production QC Specialist for SOCIAL MEDIA video content — reels, shorts, brand promos, real-estate spots, paid-social ads. Your reviewers are CD-level finicky. Editors send you their export expecting you to catch every text mistake they missed at 2am during their final render.
 
 The user message states which pass this is (technical text QC, or creative / retention) and how many frames you are receiving. Each frame is immediately preceded by a [FRAME_METADATA] block containing its locked frame index and timestamp.
@@ -1041,6 +1086,32 @@ intended, flag it (kind "audio_mismatch" if the audio confirms it, else
   • bina (without)              vs  bin / binaa  (verify intent)
 This is a checklist, NOT the limit — any meaning-changing Hinglish homophone
 counts. Apply it identically on every run for consistent results.
+
+═══════════════════════════════════════════════════════════════════════════
+TRADING TERMINOLOGY — DOMAIN GLOSSARY (HIGHEST PRIORITY)
+═══════════════════════════════════════════════════════════════════════════
+This is a TRADING-EDUCATION brand. Trading terms are core brand vocabulary, NOT
+generic words — a split, joined, or mis-hyphenated trading term is a professional
+accuracy error the editor MUST fix. Scan EVERY caption (including big stylized
+title overlays — a caps title is still a caption) for these, with zero tolerance.
+
+CANONICAL SPELLINGS — if a caption shows the LEFT (wrong) form, flag the RIGHT one:
+${tradingRules}
+
+For ANY trading-term error like the above, emit the finding as:
+  • checkId "grammar", kind "spelling"
+  • severity "error", confidence "high", priority "required"  ← NEVER "optional"
+  • msg:  Trading terminology error: caption "<wrong>" should be "<correct>"
+  • why:  "<correct>" is the standard trading term; the wrong form looks
+          unprofessional / can change the meaning.
+  • fix:  Change "<wrong>" to "<correct>"
+These are NOT optional polish — they are required brand-accuracy fixes and are the
+single most important thing this QC pass catches.
+
+KNOWN-CORRECT TERMS — treat these as a dictionary; do NOT "fix" one that is already
+spelled correctly: ${tradingVocabLine}.
+("PE" = put option, "CE" = call option — both correct as-is. "Breakout pe" /
+"Breakout PE" is correct: one word "breakout" + the term/particle.)
 
 ═══════════════════════════════════════════════════════════════════════════
 OTHER DEFECTS TO CATCH
@@ -1409,7 +1480,6 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
     const textSource = VALID_TEXT_SOURCE.has(item.textSource) ? item.textSource : "caption";
     if (captionScope !== "all" && textSource === "visual") continue;
 
-    const confidence = VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium";
     // clean() now also scrubs any leaked Devanagari, keeping the romanized text.
     const clean = (v, n) => {
       if (typeof v !== "string" || !v.trim()) return null;
@@ -1419,12 +1489,23 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
     const msg = scrubDevanagari(String(item.msg).trim()).slice(0, 400).trim();
     if (!msg) continue;                                  // was all-Devanagari → nothing left to show
     const why = clean(item.why, 300);
+    const captionText = clean(item.captionText, 300);
+    const fix = clean(item.fix, 800);
+
+    // DOMAIN ESCALATOR: a known trading term written wrong (bad form visible in the
+    // caption AND the fix proposes the canonical one) is a REQUIRED brand-accuracy
+    // error — it forces full severity and overrides the style-variant downgrade, so
+    // these are caught CONSISTENTLY rather than at the model's run-to-run discretion.
+    const tradingHit = isCreative ? null : matchTradingTerm(captionText, `${msg} ${fix || ""}`);
+    const confidence = tradingHit ? "high" : (VALID_CONFIDENCE.has(item.confidence) ? item.confidence : "medium");
     // Gate severity by confidence so only high-confidence defects read as errors.
-    const sev = gateSeverityByConfidence(item.severity, confidence);
+    const sev = tradingHit ? "error" : gateSeverityByConfidence(item.severity, confidence);
     let priority = VALID_PRIORITY.has(item.priority) ? item.priority
       : (sev === "error" ? "required" : sev === "warning" ? "optional" : "ignore");
-    // Style / romanization variants don't change meaning → never "required".
-    if (priority === "required" && isStyleVariant({ msg, why })) priority = "optional";
+    if (tradingHit) priority = "required";               // domain term → always required
+    // Style / romanization variants don't change meaning → never "required"
+    // (but a trading-term hit above already won, so this only catches non-domain splits).
+    else if (priority === "required" && isStyleVariant({ msg, why })) priority = "optional";
 
     issues.push({
       id: nextId++,
@@ -1438,11 +1519,11 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
       severity: sev,
       textSource,
       ts,
-      captionText: clean(item.captionText, 300),
+      captionText,
       audioText: clean(item.audioText, 300),
       msg,
       why,
-      fix: clean(item.fix, 800),
+      fix,
     });
   }
 
@@ -2808,7 +2889,7 @@ function ResultsStage(props) {
     activeTab, setActiveTab,
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
     requiredCount, optionalCount, ignoreCount, doneCount,
-    overallScore, onNewUpload, onExport, doneIds, toggleDone, briefWasUsed,
+    overallScore, onNewUpload, onExport, onRecheck, doneIds, toggleDone, briefWasUsed,
     memory, onLearnCorrect, onAddMissed, onUnlearn,
   } = props;
   const [showMemory, setShowMemory] = useState(false);
@@ -2842,6 +2923,11 @@ function ResultsStage(props) {
           <button onClick={onNewUpload} style={{ padding: "9px 18px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${T.border}` }}>
             ← Dashboard
           </button>
+          {onRecheck && file && (
+            <button onClick={onRecheck} title="Re-run QC on this same video — no re-upload needed" style={{ padding: "9px 16px", borderRadius: 9, background: "rgba(255,255,255,0.05)", color: T.textMute, fontSize: 12, fontWeight: 700, cursor: "pointer", border: `1px solid ${T.border}` }}>
+              ↻ Re-check
+            </button>
+          )}
           {onUnlearn && (
             <button onClick={() => setShowMemory((v) => !v)} title="Review what the AI has learned" style={{ padding: "9px 16px", borderRadius: 9, background: showMemory ? T.redTint : "rgba(255,255,255,0.05)", color: showMemory ? T.redLight : T.textMute, fontSize: 12, fontWeight: 700, cursor: "pointer", border: `1px solid ${showMemory ? T.borderHot : T.border}` }}>
               🧠 Learned {learnedCount > 0 ? `(${learnedCount})` : ""}
@@ -3311,6 +3397,16 @@ export default function App() {
     setStage("upload");
   }, []);
 
+  // Re-check an ALREADY-UPLOADED video (from a fresh scan or a reopened report)
+  // without re-uploading. Routes back to the confirm screen with the same file so
+  // the editor can pick the mode / scope / brief, then re-run. Produces a fresh
+  // report. Needs the video blob — unavailable only if it was purged for quota.
+  const recheckVideo = useCallback(() => {
+    if (!file) return;
+    currentScanIdRef.current = null;   // re-check writes a new report, doesn't overwrite
+    setStage("confirm");
+  }, [file]);
+
   // Save the finished report to IndexedDB (with the video blob, so it replays).
   const persistScan = useCallback(async (f, duration, issuesList, reuseId) => {
     if (!f || !user) return;
@@ -3742,6 +3838,7 @@ export default function App() {
             overallScore={overallScore}
             onNewUpload={goDashboard}
             onExport={handleExport}
+            onRecheck={recheckVideo}
             doneIds={doneIds}
             toggleDone={toggleDone}
             briefWasUsed={briefWasUsed}
