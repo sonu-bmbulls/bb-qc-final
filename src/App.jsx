@@ -1019,10 +1019,9 @@ overlay text, or "visual" for incidental in-shot text. In "captions only" scope
 you should normally emit ZERO "visual" findings.
 
 ═══════════════════════════════════════════════════════════════════════════
-REPEATED-LETTER TYPOS — ZERO-TOLERANCE
+REPEATED-LETTER TYPOS — FLAG THE REAL ONES, NOT OCR MISREADS
 ═══════════════════════════════════════════════════════════════════════════
-ANY word with 3+ consecutive identical letters is a typo. Period. No
-exceptions for style, no exceptions for language. Flag every single one.
+A word with 3+ consecutive identical letters is normally a typo — flag it:
 
   • "Stuudio"       → "Studio"
   • "Exxxxpo"       → "Expo"
@@ -1031,8 +1030,20 @@ exceptions for style, no exceptions for language. Flag every single one.
   • "Receeive"      → "Receive"
   • "Buuuilding"    → "Building"
 
-Minimum severity for repeated-letter typos: "warning". Use "error" when
-the intended word is unambiguous.
+BUT — READ THE TEXT, DO NOT HALLUCINATE A DOUBLED LETTER. Stylized overlay text
+(bold, white-outlined, drop-shadow, italic, motion/compression blur) is easily
+MISREAD, and an extra repeated letter is the #1 OCR artifact: "PATTERN" read as
+"PATTTERN", "ENTRY" as "ENTTRY". Before flagging a repeated-letter typo:
+  • Read the simplest correctly-spelled word the glyphs could be. If the text is
+    plausibly a normal correctly-spelled word (PATTERN, ENTRY, TARGET, BREAKOUT),
+    that is almost certainly what it says — do NOT invent an extra letter.
+  • Only flag if the extra letter is UNMISTAKABLE and clearly visible. If a letter
+    is just bold/blurred/outlined and you are not certain it is genuinely repeated,
+    treat the word as correct and emit NOTHING.
+  • When you do flag one on a stylized caption and any doubt remains, set
+    confidence "medium" (not "high") so it is verified before it counts as an error.
+Minimum severity for a confirmed repeated-letter typo: "warning"; "error" only
+when the doubled letter is unambiguous AND the intended word is obvious.
 
 ═══════════════════════════════════════════════════════════════════════════
 AUDIO vs ON-SCREEN TEXT CROSS-CHECK
@@ -1872,6 +1883,23 @@ function isAnimationSuspect(it) {
   return /truncat|cut[\s-]?off|mid-?word|does ?n.?t progress|not shown in any|incomplete caption/.test(m);
 }
 
+// 3+ identical letters in a row — the hallmark of an OCR doubled-letter artifact.
+function hasRepeatedRun(s) { return /([A-Za-z])\1\1/.test(s || ""); }
+
+// OCR-hallucination suspect: a spelling-family finding that looks like a doubled
+// /repeated-letter misread of STYLIZED overlay text ("PATTERN"→"PATTTERN"). These
+// are re-verified across neighbouring frames and dropped unless the misspelling is
+// consistently visible — a correct caption must never read as a Required error.
+function isOcrSuspect(it) {
+  if (!it || it.category === "creative_retention") return false;
+  if (it.kind && it.kind !== "spelling" && it.kind !== "consistency" && it.kind !== "caps") return false;
+  const blob = `${it.msg || ""} ${it.why || ""} ${it.fix || ""}`.toLowerCase();
+  if (/repeated[- ]?letter|consecutive identical|consecutive '?[a-z]'?|three consecutive|doubled letter|extra '?[a-z]'?\b|repeated '?[a-z]'?/.test(blob)) return true;
+  // The flagged on-screen word itself contains a 3+ run (e.g. captionText "PATTTERN").
+  if (hasRepeatedRun(it.captionText)) return true;
+  return false;
+}
+
 async function verifyFinding(it, frames, transcript, signal, opts = {}) {
   const model = opts.model || DEFAULT_MODEL;
   const ts = it.ts ?? 0;
@@ -1881,9 +1909,21 @@ async function verifyFinding(it, frames, transcript, signal, opts = {}) {
   if (window.length > 12) window = sampleEvenly(window, 12);
 
   const audio = transcript ? transcriptWindow(transcript, lo, hi) : "";
-  const content = [{
-    type: "text",
-    text: `These ${window.length} frames are in chronological order, spanning ${fmtTs(lo)}–${fmtTs(hi)} of a video whose captions animate IN progressively — one word/phrase at a time — and LAG behind the voiceover. A previous QC pass flagged this at ${fmtTs(ts)}:
+  const ocrMode = isOcrSuspect(it);
+  const promptText = ocrMode
+    ? `These ${window.length} frames are in chronological order, spanning ${fmtTs(lo)}–${fmtTs(hi)}. A previous QC pass flagged a SPELLING error here at ${fmtTs(ts)}:
+
+FLAGGED: ${it.msg}
+
+Stylized overlay text (bold, white-outlined, drop-shadow, italic, motion/compression blur) is easily MISREAD — an extra repeated letter (e.g. "PATTERN" read as "PATTTERN") is the #1 OCR artifact. Read the ACTUAL on-screen text CAREFULLY, using the CLEAREST frame available, then decide:
+  • REAL only if the misspelling is CLEARLY and CONSISTENTLY visible — the wrong form genuinely appears on screen.
+  • NOT real if the text actually reads as a normal, correctly-spelled word and the flagged typo was just a misread of stylized/blurry glyphs.
+  • When uncertain, answer NOT real. A correct caption must never be flagged.
+Output Latin-script Hinglish only (never Devanagari).
+
+Return ONLY this JSON, nothing else:
+{"real": true or false, "msg": "<refined finding if real, else empty>", "fix": "<fix if real, else empty>"}`
+    : `These ${window.length} frames are in chronological order, spanning ${fmtTs(lo)}–${fmtTs(hi)} of a video whose captions animate IN progressively — one word/phrase at a time — and LAG behind the voiceover. A previous QC pass flagged this at ${fmtTs(ts)}:
 
 FLAGGED: ${it.msg}
 
@@ -1895,8 +1935,8 @@ Judge against the caption's MOST COMPLETE state across ALL of these frames:
 Output Latin-script Hinglish only (never Devanagari).${audio ? `\n\nAUDIO (voiceover) for this window:\n${audio}` : ""}
 
 Return ONLY this JSON, nothing else:
-{"real": true or false, "msg": "<refined finding if real, else empty>", "fix": "<fix if real, else empty>"}`,
-  }];
+{"real": true or false, "msg": "<refined finding if real, else empty>", "fix": "<fix if real, else empty>"}`;
+  const content = [{ type: "text", text: promptText }];
   window.forEach((f, i) => {
     content.push({ type: "text", text: `[FRAME ${i}] timestamp=${f.ts}` });
     content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f.data } });
@@ -1921,7 +1961,9 @@ Return ONLY this JSON, nothing else:
 // out to be mid-animation reveals, refine the ones that are real, renumber ids.
 async function verifyAnimationSuspects(issues, plan, signal, onProgress = () => {}) {
   const model = (MODES[plan.modeId] || MODES[DEFAULT_MODE]).model;
-  const suspects = issues.filter(isAnimationSuspect);
+  // Verify both classes against neighbouring frames: animation/truncation reveals
+  // AND OCR doubled-letter misreads of stylized captions ("PATTERN"→"PATTTERN").
+  const suspects = issues.filter((it) => isAnimationSuspect(it) || isOcrSuspect(it));
   if (suspects.length === 0) return issues;
 
   const verdicts = new Map();
