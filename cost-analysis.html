@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>BB QC Labs — Cost of a QC Check (In-Depth)</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #15110f; margin: 0; font-size: 12px; line-height: 1.5; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  header { border-bottom: 3px solid #dc2626; padding-bottom: 14px; margin-bottom: 20px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 38px; height: 38px; border-radius: 9px; background: linear-gradient(135deg,#dc2626,#7f1d1d); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:15px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing:-0.02em; }
+  .sub { color:#6b6460; font-size:12px; margin-top:2px; }
+  h2 { font-size: 15px; margin: 26px 0 8px; color:#991b1b; border-bottom:1px solid #eee; padding-bottom:5px; }
+  h3 { font-size: 12.5px; margin: 16px 0 4px; }
+  p { margin: 6px 0; }
+  .lead { color:#3f3a37; }
+  table { width:100%; border-collapse:collapse; font-size:11px; margin:8px 0 4px; }
+  th { text-align:left; background:#faf7f5; color:#6b6460; font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; border-bottom:2px solid #eee; padding:7px 8px; }
+  td { border-bottom:1px solid #f0eeec; padding:7px 8px; vertical-align:top; }
+  td.n, th.n { text-align:right; font-variant-numeric: tabular-nums; }
+  .big { color:#dc2626; font-weight:800; }
+  .pill { display:inline-block; font-size:9px; font-weight:800; padding:2px 8px; border-radius:20px; }
+  .pill.h { background:#fef3c7; color:#92400e; }
+  .pill.d { background:#ede9fe; color:#5b21b6; }
+  .callout { background:#fafafa; border:1px solid #ececec; border-left:3px solid #dc2626; border-radius:8px; padding:11px 14px; margin:12px 0; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .card { border:1px solid #ececec; border-radius:9px; padding:12px 14px; }
+  .card .k { font-size:9.5px; text-transform:uppercase; letter-spacing:.05em; color:#8a827d; }
+  .card .v { font-size:20px; font-weight:800; margin-top:2px; }
+  code { background:#f3f0ee; padding:1px 5px; border-radius:4px; font-size:10.5px; }
+  .formula { background:#1c1714; color:#f3ddd7; border-radius:8px; padding:12px 14px; font-family:"DM Mono",Consolas,monospace; font-size:10.5px; line-height:1.7; white-space:pre-wrap; }
+  .muted { color:#8a827d; font-size:10px; }
+  ul { margin:6px 0; padding-left:18px; }
+  li { margin:3px 0; }
+  .foot { margin-top:24px; border-top:1px solid #eee; padding-top:10px; color:#8a827d; font-size:9.5px; }
+  .tag { font-size:9px; color:#8a827d; }
+  .ok { color:#15803d; font-weight:700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <div class="logo">BB</div>
+    <div>
+      <h1>Cost of a QC Check — In&#8209;Depth</h1>
+      <div class="sub">BB QC Labs · how much each scan actually costs, and why · generated 16 Jun 2026</div>
+    </div>
+  </div>
+</header>
+
+<p class="lead">Every scan spends money in two places: <strong>Claude vision</strong> (reads every frame for text/QC) and <strong>ElevenLabs Scribe</strong> (transcribes the voiceover for the audio cross&#8209;check). There is no monthly platform fee &mdash; you pay per scan, drawn from your Anthropic and ElevenLabs credit. This document breaks down the exact math the app uses, real per&#8209;reel costs, and the levers that move the number.</p>
+
+<div class="callout">
+  <strong>The one&#8209;line answer.</strong> A typical <strong>30&#8209;second vertical reel</strong> costs about <span class="big">$0.10</span> on <span class="pill h">Urgent</span> and about <span class="big">$0.70</span> on <span class="pill d">Deep Audit</span>. Audio transcription adds well under a cent. Cost scales with <em>length × frame rate × resolution</em> &mdash; image tokens, not instructions, dominate the bill.
+</div>
+
+<h2>1. What you're billed for (rates)</h2>
+<table>
+  <thead><tr><th>Component</th><th>Used by</th><th class="n">Rate</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Claude Haiku 4.5 &mdash; input</td><td><span class="pill h">Urgent</span></td><td class="n">$1.00 / 1M tok</td><td>Frames + instructions in</td></tr>
+    <tr><td>Claude Haiku 4.5 &mdash; output</td><td><span class="pill h">Urgent</span></td><td class="n">$5.00 / 1M tok</td><td>The findings JSON</td></tr>
+    <tr><td>Claude Sonnet 4.6 &mdash; input</td><td><span class="pill d">Deep</span></td><td class="n">$3.00 / 1M tok</td><td>Frames + instructions in</td></tr>
+    <tr><td>Claude Sonnet 4.6 &mdash; output</td><td><span class="pill d">Deep</span></td><td class="n">$15.00 / 1M tok</td><td>The findings JSON</td></tr>
+    <tr><td>Prompt cache &mdash; read</td><td>both</td><td class="n">~0.1&times; input</td><td>Re&#8209;used instruction block</td></tr>
+    <tr><td>Prompt cache &mdash; write</td><td>both</td><td class="n">~1.25&times; input</td><td>Paid once per scan</td></tr>
+    <tr><td>ElevenLabs Scribe (speech&#8209;to&#8209;text)</td><td>both</td><td class="n">$0.40 / hour</td><td>= $0.0067 per minute of audio</td></tr>
+  </tbody>
+</table>
+<p class="muted">Anthropic pricing per million tokens, June 2026. Image inputs are billed as input tokens at roughly <code>(width × height) / 750</code> tokens per frame.</p>
+
+<h2>2. Where the money goes: image tokens dominate</h2>
+<p>The QC engine samples the video into still frames and sends them to Claude in small batches. <strong>The frames are ~95% of the cost.</strong> The instruction block (the big QC ruleset) is sent once and then served from cache at ~10% price on every later batch, so it barely registers. That means the three real cost levers are:</p>
+<ul>
+  <li><strong>Length</strong> &mdash; more seconds → more frames.</li>
+  <li><strong>Frame rate</strong> &mdash; Urgent samples 1 fps; Deep samples 2 fps (twice the frames).</li>
+  <li><strong>Resolution</strong> &mdash; a 1080&times;1920 reel is ~2,765 tokens/frame; a 1280&times;720 clip is ~1,229. The app caps width at 1600px.</li>
+</ul>
+
+<div class="grid2">
+  <div class="card"><div class="k">Vertical reel 1080&times;1920</div><div class="v">~2,765</div><div class="muted">tokens per frame</div></div>
+  <div class="card"><div class="k">Landscape 1280&times;720</div><div class="v">~1,229</div><div class="muted">tokens per frame</div></div>
+</div>
+
+<h2>3. The two modes</h2>
+<table>
+  <thead><tr><th>Mode</th><th>Model</th><th class="n">Frame rate</th><th>Creative pass</th><th>Best for</th></tr></thead>
+  <tbody>
+    <tr><td><span class="pill h">Urgent Pass</span></td><td>Haiku 4.5</td><td class="n">1 fps</td><td>No</td><td>Fast, cheap typo / grammar / safe&#8209;zone check</td></tr>
+    <tr><td><span class="pill d">Deep Audit</span></td><td>Sonnet 4.6</td><td class="n">2 fps</td><td>Yes (hooks, pacing, branding)</td><td>Full pre&#8209;delivery review</td></tr>
+  </tbody>
+</table>
+<p class="muted">Deep costs more for three compounding reasons: a pricier model (3&times;/3&times; the token rate), double the frames (2 fps), and an extra holistic "creative &amp; retention" pass over 12 sampled frames.</p>
+
+<h2>4. Cost per reel &mdash; vertical 1080&times;1920 (most common)</h2>
+<table>
+  <thead><tr><th>Clip length</th><th class="n">Frames</th><th class="n">API calls</th><th class="n">Input tok</th><th class="n">Vision $</th><th class="n">Audio $</th><th class="n">Total</th></tr></thead>
+  <tbody>
+    <tr><td><span class="pill h">Urgent</span> 15s</td><td class="n">15</td><td class="n">4</td><td class="n">~45k</td><td class="n">$0.052</td><td class="n">$0.002</td><td class="n big">$0.05</td></tr>
+    <tr><td><span class="pill h">Urgent</span> 30s</td><td class="n">30</td><td class="n">8</td><td class="n">~87k</td><td class="n">$0.101</td><td class="n">$0.003</td><td class="n big">$0.10</td></tr>
+    <tr><td><span class="pill h">Urgent</span> 60s</td><td class="n">60</td><td class="n">15</td><td class="n">~172k</td><td class="n">$0.198</td><td class="n">$0.007</td><td class="n big">$0.20</td></tr>
+    <tr><td><span class="pill d">Deep</span> 15s</td><td class="n">30</td><td class="n">9</td><td class="n">~121k</td><td class="n">$0.410</td><td class="n">$0.002</td><td class="n big">$0.41</td></tr>
+    <tr><td><span class="pill d">Deep</span> 30s</td><td class="n">60</td><td class="n">16</td><td class="n">~206k</td><td class="n">$0.701</td><td class="n">$0.003</td><td class="n big">$0.70</td></tr>
+    <tr><td><span class="pill d">Deep</span> 60s</td><td class="n">120</td><td class="n">31</td><td class="n">~375k</td><td class="n">$1.289</td><td class="n">$0.007</td><td class="n big">$1.29</td></tr>
+  </tbody>
+</table>
+<p class="muted">Computed with the app's own <code>estimateScanCost()</code> formula. "Total" rounds vision + audio. A landscape 16:9 clip at the same length costs roughly <strong>55% less</strong> (fewer tokens per frame).</p>
+
+<h2>5. Monthly projection</h2>
+<p>Assuming <strong>100 reels per month</strong> at 30s vertical:</p>
+<table>
+  <thead><tr><th>Usage pattern</th><th class="n">Per reel</th><th class="n">Per month (100)</th></tr></thead>
+  <tbody>
+    <tr><td>All Urgent</td><td class="n">$0.10</td><td class="n big">~$10</td></tr>
+    <tr><td>Mixed (80 Urgent + 20 Deep)</td><td class="n">&mdash;</td><td class="n big">~$22</td></tr>
+    <tr><td>All Deep Audit</td><td class="n">$0.70</td><td class="n big">~$70</td></tr>
+  </tbody>
+</table>
+<p class="muted">Audio adds ~$0.33/month at this volume &mdash; effectively a rounding error. Re&#8209;scans (Resume) only re&#8209;run the segments that failed, so they cost a fraction of a full scan.</p>
+
+<h2>6. How to spend less</h2>
+<ul>
+  <li><strong>Default to Urgent.</strong> It catches the objective text errors (typos, grammar, safe&#8209;zones) at ~1/7th the cost of Deep. Reserve Deep for final pre&#8209;delivery review.</li>
+  <li><strong>Trim before scanning.</strong> Cost is linear in length &mdash; QC the cut, not the raw export.</li>
+  <li><strong>Resolution matters.</strong> A 1080&#8209;wide reel costs ~2.2&times; a 720&#8209;wide one per frame. The app already caps width at 1600px.</li>
+  <li><strong>The instruction block is cached</strong> &mdash; back&#8209;to&#8209;back scans in the same session reuse it, so you pay the ~1.25&times; cache&#8209;write premium once, not per scan.</li>
+  <li><strong>Teach it once.</strong> The "Learn" memory and caption&#8209;only scope cut false positives &mdash; fewer junk findings means slightly less output spend and far less of your review time.</li>
+</ul>
+
+<h2>7. The exact formula (for the record)</h2>
+<div class="formula">frames        = clamp(8 … 600, ceil(duration_sec × fps))
+tokens/frame  = round(min(width,1600) × scaledHeight / 750)
+tech_batches  = ceil(frames / 4)            # 4 frames per API call
+calls         = tech_batches (+1 creative pass on Deep)
+instruction   = 2600 × (1 + 0.1 × (calls−1))   # 1 cache write + cache reads
+input_tokens  = instruction + (frames + creativeFrames) × tokens/frame
+output_tokens = calls × 350
+cost          = input/1e6 × price_in  +  output/1e6 × price_out
+audio_cost    = (duration_sec / 3600) × $0.40</div>
+<p class="muted">Worked example &mdash; Urgent, 30s vertical reel: 30 frames → 8 calls → input ≈ 87,370 tok × $1 = $0.087; output 2,800 tok × $5 = $0.014; audio $0.003 → <strong>≈ $0.10</strong>. This is exactly what the cost calculator on the Review screen shows before you start a scan.</p>
+
+<div class="callout">
+  <strong>Bottom line.</strong> Routine QC on short social reels runs <span class="ok">a few cents to ~$0.20</span> a scan on Urgent. A full creative Deep Audit on a minute&#8209;long vertical reel tops out around <span class="big">$1.30</span>. For a shop doing ~100 reels a month, expect a <strong>$10&ndash;$70/month</strong> Claude bill depending on how often you run Deep, plus pennies for audio.
+</div>
+
+<div class="foot">
+  Estimates use Anthropic list pricing (Haiku 4.5 $1/$5, Sonnet 4.6 $3/$15 per million tokens) and ElevenLabs Scribe ($0.40/hr), June 2026, and the app's <code>estimateScanCost()</code> model. Real cost varies with how many findings come back and the exact frame resolution. Vision LLMs are not perfectly deterministic, so token counts drift slightly run to run. No data leaves your browser except the frames/audio sent to the QC APIs.
+</div>
+
+</div>
+</body>
+</html>

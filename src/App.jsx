@@ -188,7 +188,7 @@ function isSoftNonActionable(it) {
 // so genuine English typos (e.g. "operationa"→"operations") are NOT downgraded.
 function isStyleVariant(it) {
   const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
-  return /\bvariant\b|non[- ]standard|informal|stylistic|romaniz|abbreviat|missing vowel|double[- ]letter|single[- ]e\b/i.test(m);
+  return /\bvariant\b|non[- ]standard|informal|stylistic|romaniz|abbreviat|missing vowel|double[- ]letter|single[- ]e\b|one word|single word|compound word|two words|split by a space|should be joined|word segmentation/i.test(m);
 }
 
 const T = {
@@ -1070,6 +1070,19 @@ OTHER DEFECTS TO CATCH
    text overlapping other graphics, illegible from low contrast.
 7. Consistency — same word or brand spelled/styled differently across
    frames within this video.
+8. Word segmentation — a single compound word that has been SPLIT by a space,
+   or two words wrongly JOINED. This catches stylized titles where each token
+   is individually a real word so the spell-check above does NOT fire:
+     • "BREAK OUT PE"  → "BREAKOUT PE"   (breakout is one noun)
+     • "log in" (noun) → "login"   • "set up" (noun) → "setup"
+     • "Followus"      → "Follow us"  (wrongly joined)
+   Apply this to styled centre-screen / title-card overlays too — a big
+   decorative caps title is still a caption and IS in scope. BE CONSERVATIVE:
+   only flag when the joined/split form is clearly the correct one in context.
+   This is a polish issue, not a hard error: kind "spelling", confidence
+   "medium" (or "low" if it might be a deliberate style choice), priority
+   "optional" — NEVER "required". A genuine verb phrase ("break out of the
+   range") is correct as two words — do not flag it.
 
 ═══════════════════════════════════════════════════════════════════════════
 DO NOT FLAG
