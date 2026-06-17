@@ -110,10 +110,9 @@ const VERIFY_FORWARD_SEC = 6;     // seconds AHEAD to look — captions reveal p
 
 // ── Review playback ───────────────────────────────────────────────────────────
 // Clicking an issue lands this many seconds BEFORE the flagged frame (then plays)
-// so the reviewer gets lead-in context — caption animation + audio — instead of
-// landing exactly on the (possibly mid-animation) error frame. ~0.6s ≈ 3–5 frames
-// at 24–30fps, within the requested 0.5–1s window.
-const ISSUE_PREROLL_SEC = 0.6;
+// so the reviewer gets lead-in context — was the caption/audio already present a
+// few seconds earlier? — instead of landing exactly on the error frame.
+const ISSUE_PREROLL_SEC = 3;
 
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
