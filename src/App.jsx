@@ -109,10 +109,10 @@ const VERIFY_FORWARD_SEC = 6;     // seconds AHEAD to look — captions reveal p
                                   // seconds later; we must look far enough ahead to see it
 
 // ── Review playback ───────────────────────────────────────────────────────────
-// Clicking an issue lands this many seconds BEFORE the flagged frame (then plays)
-// so the reviewer gets lead-in context — was the caption/audio already present a
-// few seconds earlier? — instead of landing exactly on the error frame.
-const ISSUE_PREROLL_SEC = 3;
+// Clicking an issue keeps the EXACT issue timestamp on the card, but starts
+// PLAYBACK this many seconds earlier so the reviewer gets a little lead-in context
+// (was the caption/audio already present just before the flagged frame?).
+const ISSUE_PREROLL_SEC = 1;
 
 // ── Cost calculator (shown on the confirm screen before scanning) ─────────────
 // Vision token usage is estimated from image dimensions: tokens ≈ (w × h) / 750.
@@ -1189,6 +1189,20 @@ BE CONSERVATIVE — speech-to-text is imperfect and timing can drift:
   • Do NOT flag when the audio is unclear or simply worded differently.
   • If NO AUDIO TRANSCRIPT is provided, skip this section entirely.
 
+NUMBERS — COMPARE THE VALUE, NOT THE WORDS (CRITICAL):
+  Hindi/Hinglish number WORDS in the audio mean the same as DIGITS in the caption.
+  Convert the spoken words to a number and compare numeric VALUES — never flag a
+  caption just because it shows digits while the audio speaks the words.
+    • ek hazar = 1,000 · do hazar = 2,000 · teen hazar = 3,000 · char hazar = 4,000
+    • paanch hazar = 5,000 · das hazar = 10,000 · chaudah hazar = 14,000
+    • bees hazar = 20,000 · lakh = 1,00,000 · crore = 1,00,00,000 · sau = 100
+  Currency words/symbols are equivalent: dollar/dollars/$ , rupees/INR/₹ , USD.
+  Examples — NOT errors (same value), emit NOTHING:
+    • caption "$4,000"  + audio "char hazar dollar"  (4,000 = 4,000)
+    • caption "$14,000" + audio "chaudah hazar"       (14,000 = 14,000)
+  Flag a number mismatch ONLY when the numeric VALUES genuinely differ:
+    • caption "$4,000" + audio "chaudah hazar dollar" (4,000 ≠ 14,000) → error.
+
 ═══════════════════════════════════════════════════════════════════════════
 HINGLISH PHONETIC CONFUSIONS — CHECK THESE EVERY TIME
 ═══════════════════════════════════════════════════════════════════════════
@@ -1873,6 +1887,66 @@ function isNonIssue(it) {
   return /no change required|no fix required|no error detected|caption is correct|is correct hinglish|already correct|matches the voiceover|caption matches audio|caption is grammatically sound|no change needed|correct as[- ]is/.test(m);
 }
 
+// ── Hindi/Hinglish number normalization ───────────────────────────────────────
+// "char hazar dollar" and "$4,000" mean the SAME amount — never a number mismatch.
+// We parse both the caption and the spoken phrase to a numeric value and, when they
+// match, drop the finding. Handles ek..unnees + tens, sau/hazaar/lakh/crore.
+const HINGLISH_UNITS = {
+  zero: 0, ek: 1, do: 2, teen: 3, char: 4, chaar: 4, paanch: 5, panch: 5, paach: 5,
+  chhe: 6, che: 6, chah: 6, cheh: 6, saat: 7, aath: 8, nau: 9, das: 10, dus: 10,
+  gyarah: 11, gyaarah: 11, barah: 12, baarah: 12, terah: 13, terrah: 13, chaudah: 14, chaudhah: 14,
+  pandrah: 15, pandhrah: 15, solah: 16, satrah: 17, satrrah: 17, atharah: 18, atharrah: 18, unnees: 19, unnis: 19,
+  bees: 20, bis: 20, tees: 30, chalis: 40, chaalis: 40, pachas: 50, pachaas: 50,
+  saath: 60, sattar: 70, assi: 80, assee: 80, nabbe: 90, navve: 90,
+};
+const HINGLISH_SCALES = { sau: 100, soo: 100, hazar: 1000, hazaar: 1000, hazoor: 1000, hajar: 1000, lakh: 100000, lac: 100000, lakhs: 100000, crore: 10000000, cr: 10000000, karod: 10000000, karor: 10000000 };
+// Spoken phrase → number. Returns null if no number words are present.
+function parseHinglishNumber(text) {
+  if (!text) return null;
+  const toks = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  let total = 0, current = 0, sawAny = false, sawDigit = null;
+  for (const tk of toks) {
+    if (/^\d+$/.test(tk)) { sawDigit = (sawDigit ?? 0) + Number(tk); sawAny = true; continue; }
+    if (tk in HINGLISH_UNITS) { current += HINGLISH_UNITS[tk]; sawAny = true; }
+    else if (tk in HINGLISH_SCALES) {
+      const s = HINGLISH_SCALES[tk];
+      if (s === 100) current = (current || 1) * 100;
+      else { total += (current || 1) * s; current = 0; }
+      sawAny = true;
+    }
+  }
+  if (!sawAny) return null;
+  const wordVal = total + current;
+  // A bare spoken digit ("4000 dollar") plus optional word value.
+  return wordVal > 0 ? wordVal + (sawDigit && wordVal === 0 ? sawDigit : 0) : sawDigit;
+}
+// Numeric value written in a caption: "$14,000", "₹4,000", "14000", "14k", "2 lakh".
+function parseCaptionNumber(text) {
+  if (!text) return null;
+  const t = String(text).toLowerCase();
+  const wordScaled = parseHinglishNumber(t);                    // catches "2 lakh" / "char hazar" in captions too
+  const m = t.replace(/[,\s]/g, "").match(/(\d+(?:\.\d+)?)(k|m)?/);
+  if (m) {
+    let n = parseFloat(m[1]);
+    if (m[2] === "k") n *= 1000; else if (m[2] === "m") n *= 1000000;
+    // If the caption also has a scale word (lakh/crore) the word parser is better.
+    if (/\b(lakh|lac|crore|cr|hazaar|hazar)\b/.test(t) && wordScaled) return wordScaled;
+    return n;
+  }
+  return wordScaled;
+}
+// A number-mismatch finding whose caption and voiceover are the SAME amount → false positive.
+function isNumberMatchFalsePositive(it) {
+  if (!it || !it.captionText || !it.audioText) return false;
+  const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
+  const aboutNumbers = /number|amount|figure|hazar|hazaar|lakh|crore|thousand|price|\$|₹|rupee|dollar/.test(m + " " + it.captionText.toLowerCase());
+  if (!aboutNumbers) return false;
+  const capN = parseCaptionNumber(it.captionText);
+  const audN = parseCaptionNumber(it.audioText);   // audioText may hold "char hazar dollar"
+  if (capN == null || audN == null) return false;
+  return capN === audN;   // same numeric meaning → not an error
+}
+
 // ── REDUCER ───────────────────────────────────────────────────────────────────
 // Combine the JSON outputs from every parallel segment (+ the creative pass)
 // back into ONE chronological timeline: flatten → drop progressive-reveal & "no
@@ -1883,7 +1957,7 @@ function reducePlan(plan) {
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isAllowlisted(it, allow));
+  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isNumberMatchFalsePositive(it) && !isAllowlisted(it, allow));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
