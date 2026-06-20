@@ -3780,6 +3780,60 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
   );
 }
 
+// ── Post-scan reminder + confetti ─────────────────────────────────────────────
+function Confetti({ count = 90 }) {
+  const palette = ["#ef4444", "#f59e0b", "#10b981", "#a855f7", "#3b82f6", "#fca5a5", "#fcd34d"];
+  const pieces = useMemo(() => Array.from({ length: count }, (_, i) => ({
+    left: Math.random() * 100,
+    bg: palette[i % palette.length],
+    delay: Math.random() * 0.5,
+    dur: 2.6 + Math.random() * 2,
+    w: 6 + Math.random() * 7,
+    rot: Math.random() * 360,
+  })), [count]);
+  return (
+    <div style={{ position: "fixed", inset: 0, pointerEvents: "none", overflow: "hidden", zIndex: 100 }}>
+      {pieces.map((p, i) => (
+        <div key={i} style={{
+          position: "absolute", top: -24, left: `${p.left}%`, width: p.w, height: p.w * 0.55,
+          background: p.bg, borderRadius: 2, opacity: 0.92, transform: `rotate(${p.rot}deg)`,
+          animation: `confettiFall ${p.dur}s linear ${p.delay}s forwards`,
+        }} />
+      ))}
+    </div>
+  );
+}
+
+// Shown once when a scan FINISHES. Motivates on a clean result, but always reminds
+// the editor that QC is fallible and a human should do the final review.
+function ScanDoneModal({ clean, mistakes, review, onClose }) {
+  return (
+    <div onClick={onClose} className="fade-in" style={{ position: "fixed", inset: 0, background: "rgba(5,3,4,0.66)", backdropFilter: "blur(5px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 90, padding: 20 }}>
+      {clean && <Confetti />}
+      <div onClick={(e) => e.stopPropagation()} className="pop-in" style={{ position: "relative", zIndex: 95, width: "100%", maxWidth: 440, background: "#140e11", border: `1px solid ${clean ? "rgba(16,185,129,0.4)" : T.borderHot}`, borderRadius: 18, padding: "28px 26px", textAlign: "center", boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ fontSize: 46, marginBottom: 8 }}>{clean ? "🎉" : "🔍"}</div>
+        <h2 style={{ fontSize: 20, fontWeight: 800, letterSpacing: "-0.01em", marginBottom: 8, color: clean ? "#34d399" : "white" }}>
+          {clean ? "Great work! No major QC issues found." : "QC found some issues to review."}
+        </h2>
+        <p style={{ fontSize: 13.5, color: T.textMute, lineHeight: 1.55, marginBottom: 16 }}>
+          {clean
+            ? "Your video looks clean — but please review it once from your side before final upload."
+            : <>{mistakes > 0 ? <><strong style={{ color: T.redLight }}>{mistakes}</strong> to fix</> : "Nothing must-fix"}{review > 0 ? <> · <strong style={{ color: "#fcd34d" }}>{review}</strong> to review</> : ""}. Please check each issue before the final upload.</>}
+        </p>
+        <div style={{ display: "flex", gap: 9, alignItems: "flex-start", textAlign: "left", padding: "11px 13px", borderRadius: 11, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, marginBottom: 18 }}>
+          <span style={{ fontSize: 16, lineHeight: 1.2 }}>🤖</span>
+          <p style={{ fontSize: 11.5, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
+            I'm still learning, so I can also miss something or make a mistake. Please do the final approval yourself before uploading.
+          </p>
+        </div>
+        <button onClick={onClose} style={{ width: "100%", padding: "12px 18px", borderRadius: 11, cursor: "pointer", border: "none", background: clean ? "linear-gradient(135deg,#10b981,#047857)" : T.gradient, color: "white", fontSize: 14, fontWeight: 800, boxShadow: clean ? "0 4px 14px rgba(16,185,129,0.35)" : "0 4px 14px rgba(220,38,38,0.35)" }}>
+          Got it — I'll review it →
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 5. MAIN APP
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3814,6 +3868,7 @@ export default function App() {
   const [memory, setMemory] = useState(() => loadMemory(loadUser())); // learned corrections (allow + typos)
   const [allScans, setAllScans] = useState([]);            // ADMIN: every scan in this browser
   const [feedback, setFeedback] = useState(loadFeedback);  // ADMIN: QC-feedback log
+  const [showScanDone, setShowScanDone] = useState(false); // post-scan reminder modal
   const admin = isAdmin(user);
 
   const fileRef = useRef(null);
@@ -3868,7 +3923,7 @@ export default function App() {
 
   const handleLogout = useCallback(() => {
     abortRef.current?.abort();
-    clearStoredUser(); setUser(""); setScans([]); setMemory(EMPTY_MEMORY); setStage("login");
+    clearStoredUser(); setUser(""); setScans([]); setMemory(EMPTY_MEMORY); setShowScanDone(false); setStage("login");
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = null;
@@ -3879,6 +3934,7 @@ export default function App() {
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     setScanDeadline(null); checkpointRef.current = null; currentScanIdRef.current = null;
+    setShowScanDone(false);
     setStage("dashboard");
     if (user) refreshScans(user);
   }, [user, refreshScans]);
@@ -3938,6 +3994,7 @@ export default function App() {
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     checkpointRef.current = null; currentScanIdRef.current = id;
     reviewCtxRef.current = { scanId: id, owner: rec.user || "", fileName: rec.fileName || "" };
+    setShowScanDone(false);   // reopening a saved report is not a fresh scan
     setStage("results");
   }, [user]);
 
@@ -4000,6 +4057,7 @@ export default function App() {
     setAnalysisError(null);
     setAnalysisWarning(null);
     setActiveFilter("mistake");
+    setShowScanDone(false);
     setCanResume(false);
     setDoneIds(new Set());
     setBriefWasUsed(briefForThisRun.length > 0);
@@ -4065,6 +4123,7 @@ export default function App() {
       persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
+      setShowScanDone(true);   // post-scan reminder (confetti if clean)
       setStage("results");
     } catch (e) {
       setScanDeadline(null);
@@ -4110,6 +4169,7 @@ export default function App() {
       persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
       setScanDeadline(null);
       await new Promise((r) => setTimeout(r, 400));
+      setShowScanDone(true);   // post-scan reminder (confetti if clean)
       setStage("results");
     } catch (e) {
       setScanDeadline(null);
@@ -4389,6 +4449,14 @@ export default function App() {
           />
         )}
       </div>
+      {showScanDone && stage === "results" && (
+        <ScanDoneModal
+          clean={mistakeCount === 0}
+          mistakes={mistakeCount}
+          review={reviewCount}
+          onClose={() => setShowScanDone(false)}
+        />
+      )}
     </div>
   );
 }
