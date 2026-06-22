@@ -187,20 +187,17 @@ function isCapitalizationFinding(it) {
 function issueTier(it) {
   if (!it) return "review";
   if (it.category === "creative_retention") return it.tier && VALID_TIER.has(it.tier) ? it.tier : "review";
-  // 1) STYLE — capitalization, romanization variants, consistency, pure style
-  if (it.kind === "consistency") return "style";
+  // 1) STYLE — capitalization, number formatting, romanization variants, consistency
+  if (it.kind === "consistency" || it.kind === "formatting") return "style";
   if (isCapitalizationFinding(it)) return "style";
   if (isStyleVariant(it)) return "style";
   if (it.priority === "ignore") return "style";
   // 2) MISTAKE — a confirmed trading-term error always counts
   if (matchTradingTerm(it.captionText, `${it.msg || ""} ${it.fix || ""}`)) return "mistake";
-  // 3) REVIEW — anything uncertain
+  // 3) REVIEW — anything uncertain. Audio mismatches are CONTEXT-only now: the
+  //    voiceover never forces a "mistake" — at most it flags a word to review.
   if (isOcrSuspect(it)) return "review";
-  if (it.kind === "audio_mismatch") {
-    const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
-    const uncertain = /missing|incomplete|omit|not spoken|does ?n.?t|word order|already shown|extra |only the|unclear/.test(m);
-    return (uncertain || it.confidence !== "high") ? "review" : "mistake";
-  }
+  if (it.kind === "audio_mismatch") return "review";
   if (it.confidence === "low" || it.confidence === "medium") return "review";
   // 4) honor an explicit model tier of review/style if it set one
   if (it.tier === "review" || it.tier === "style") return it.tier;
@@ -1155,61 +1152,46 @@ Minimum severity for a confirmed repeated-letter typo: "warning"; "error" only
 when the doubled letter is unambiguous AND the intended word is obvious.
 
 ═══════════════════════════════════════════════════════════════════════════
-AUDIO vs ON-SCREEN TEXT CROSS-CHECK
+YOUR JOB = CHECK THE VISIBLE ON-SCREEN TEXT (NOT SUBTITLE MATCHING)
 ═══════════════════════════════════════════════════════════════════════════
-When the user message includes an AUDIO TRANSCRIPT, it is what the voiceover
-actually says (speech-to-text, time-aligned). Use it to catch captions that
-contradict the spoken word.
+This is NOT a subtitle/caption-matching tool. Your job is to judge whether the
+text VISIBLE ON SCREEN is clean and correct — spelling, grammar, trading terms,
+numbers, ordinals, brand names, typos. The AUDIO TRANSCRIPT is CONTEXT ONLY.
 
-STEP 1 — NORMALIZE: the transcript may be in Hindi (Devanagari) or romanized,
-while the on-screen captions are usually romanized Hinglish (or English).
-Mentally transliterate the transcript into the SAME script/register as the
-caption so the two are comparable (e.g. "मज़बूत" ≈ "mazboot", "नींव" ≈ "neev").
+Short-form editors deliberately show only the KEY phrase, not the whole spoken
+line. That is normal and CORRECT. Therefore:
+  • NEVER flag a caption for showing LESS than the voiceover, being "incomplete",
+    "missing" words, "not showing the full line", or "should include <spoken
+    words>". The editor does not need to put every spoken word on screen.
+  • Do NOT emit "audio mismatch" findings. The only time the audio matters is to
+    help you confirm a word that is ALREADY WRONG on screen — and even then you
+    report it as a SPELLING issue of the visible word, not as an audio mismatch.
+  • If a VISIBLE word is itself a real-but-wrong word that the sentence's own
+    meaning rules out (e.g. "mazboor" where "mazboot" is clearly intended), flag
+    it as kind "spelling" — judged from the visible text, not from the audio.
 
-STEP 2 — COMPARE each caption against the time-aligned audio. Flag a finding
-ONLY when a caption word is a REAL but WRONG word that does not match what the
-audio says AND the difference changes meaning. The classic case:
-  • audio says "mazboot" (strong) but the caption reads "mazboor" (forced) →
-    "error". msg format: Audio mismatch: caption "mazboor" but voiceover says
-    "mazboot" → "mazboot". Use checkId "grammar", severity "error".
+NUMBERS — COMPARE THE VALUE, NEVER THE FORMATTING:
+  Same numeric VALUE = correct, regardless of spoken words or commas:
+    • "$4000" = "$4,000" = "char hazar" = "four thousand" = 4,000  → all equal.
+  • NEVER flag a number whose value is correct as a mistake or "audio mismatch".
+  • A run-together amount ("$3000", "$15000") is at most an OPTIONAL FORMATTING
+    suggestion — kind "formatting", priority "optional": e.g. "Number formatting:
+    use $3,000 instead of $3000." This is Optional Style, never a Mistake.
+  • Flag a real number MISTAKE only when the VALUE shown is wrong in context
+    (e.g. a clearly mistyped digit). A different spoken number is NOT proof the
+    caption is wrong — the visible value is what matters.
 
-ONLY FLAG SUBSTITUTIONS — never "missing" text:
-  • Flag ONLY a wrong/substituted word that IS visible on screen (mazboor for
-    mazboot). NEVER flag because the caption shows LESS than the audio, is
-    "incomplete", "does not progress", or is "missing" the rest of the spoken
-    phrase. Captions reveal PROGRESSIVELY and LAG behind the voiceover — the
-    remaining words appear in LATER frames that THIS slice cannot see.
-  • A caption that shows a correct SUBSET of what the audio says is CORRECT.
-  • You only see a few frames — NEVER claim a caption "does not progress" or
-    "does not show X in any frame". You cannot know what the other frames show.
-
-BE CONSERVATIVE — speech-to-text is imperfect and timing can drift:
-  • Do NOT flag normal Hinglish spelling variants, filler words, or rephrasings
-    that don't change meaning.
-  • Do NOT flag when the audio is unclear or simply worded differently.
-  • If NO AUDIO TRANSCRIPT is provided, skip this section entirely.
-
-NUMBERS — COMPARE THE VALUE, NOT THE WORDS (CRITICAL):
-  Hindi/Hinglish number WORDS in the audio mean the same as DIGITS in the caption.
-  Convert the spoken words to a number and compare numeric VALUES — never flag a
-  caption just because it shows digits while the audio speaks the words.
-    • ek hazar = 1,000 · do hazar = 2,000 · teen hazar = 3,000 · char hazar = 4,000
-    • paanch hazar = 5,000 · das hazar = 10,000 · chaudah hazar = 14,000
-    • bees hazar = 20,000 · lakh = 1,00,000 · crore = 1,00,00,000 · sau = 100
-  Currency words/symbols are equivalent: dollar/dollars/$ , rupees/INR/₹ , USD.
-  Examples — NOT errors (same value), emit NOTHING:
-    • caption "$4,000"  + audio "char hazar dollar"  (4,000 = 4,000)
-    • caption "$14,000" + audio "chaudah hazar"       (14,000 = 14,000)
-  Flag a number mismatch ONLY when the numeric VALUES genuinely differ:
-    • caption "$4,000" + audio "chaudah hazar dollar" (4,000 ≠ 14,000) → error.
+ORDINAL NUMBERS — these ARE real visible-text mistakes (flag as "spelling"):
+  • "1nd" → "1st"   • "2st" → "2nd"   • "3nd" → "3rd"   • "21th" → "21st"
+  Wrong ordinal suffixes are objective errors visible on screen.
 
 ═══════════════════════════════════════════════════════════════════════════
 HINGLISH PHONETIC CONFUSIONS — CHECK THESE EVERY TIME
 ═══════════════════════════════════════════════════════════════════════════
-These near-identical Hinglish pairs change MEANING. Whenever the caption shows
-the LEFT-type form, confirm it against the audio/context — if the right form is
-intended, flag it (kind "audio_mismatch" if the audio confirms it, else
-"spelling"; severity "error" when meaning clearly flips):
+These near-identical Hinglish pairs change MEANING. Whenever the VISIBLE caption
+shows the LEFT-type form where the sentence's own meaning calls for the right one,
+flag it as kind "spelling" (judge from the visible text; the audio is only context,
+never the trigger; severity "error" when meaning clearly flips):
   • mazboor (forced/helpless)   vs  mazboot (strong)
   • mane (accepted)             vs  maane (meaning / "are considered")
   • niv / niw                   vs  neev (foundation)
@@ -1898,8 +1880,19 @@ const HINGLISH_UNITS = {
   pandrah: 15, pandhrah: 15, solah: 16, satrah: 17, satrrah: 17, atharah: 18, atharrah: 18, unnees: 19, unnis: 19,
   bees: 20, bis: 20, tees: 30, chalis: 40, chaalis: 40, pachas: 50, pachaas: 50,
   saath: 60, sattar: 70, assi: 80, assee: 80, nabbe: 90, navve: 90,
+  // English number words (voiceovers are often English)
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+  eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60,
+  seventy: 70, eighty: 80, ninety: 90,
 };
-const HINGLISH_SCALES = { sau: 100, soo: 100, hazar: 1000, hazaar: 1000, hazoor: 1000, hajar: 1000, lakh: 100000, lac: 100000, lakhs: 100000, crore: 10000000, cr: 10000000, karod: 10000000, karor: 10000000 };
+const HINGLISH_SCALES = {
+  sau: 100, soo: 100, hundred: 100,
+  hazar: 1000, hazaar: 1000, hazoor: 1000, hajar: 1000, thousand: 1000, k: 1000,
+  lakh: 100000, lac: 100000, lakhs: 100000,
+  crore: 10000000, cr: 10000000, karod: 10000000, karor: 10000000,
+  million: 1000000, m: 1000000, billion: 1000000000,
+};
 // Spoken phrase → number. Returns null if no number words are present.
 function parseHinglishNumber(text) {
   if (!text) return null;
@@ -1935,16 +1928,61 @@ function parseCaptionNumber(text) {
   }
   return wordScaled;
 }
-// A number-mismatch finding whose caption and voiceover are the SAME amount → false positive.
-function isNumberMatchFalsePositive(it) {
-  if (!it || !it.captionText || !it.audioText) return false;
-  const m = `${it.msg || ""} ${it.why || ""}`.toLowerCase();
-  const aboutNumbers = /number|amount|figure|hazar|hazaar|lakh|crore|thousand|price|\$|₹|rupee|dollar/.test(m + " " + it.captionText.toLowerCase());
-  if (!aboutNumbers) return false;
+// A money amount written without thousands separators ("$3000", "₹15000") — the
+// VALUE is fine, the formatting could be cleaner. Years like "2024" are excluded
+// (we require a currency symbol/word so we don't reformat dates).
+function isPoorlyFormattedMoney(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase();
+  if (!/[$₹]|rupee|dollar|inr|usd/.test(t)) return false;
+  const digits = (t.match(/\d[\d,]*(?:\.\d+)?/) || [""])[0];
+  return /^\d{4,}$/.test(digits.replace(/[,.]/g, "")) && !digits.includes(",");
+}
+// "$3000" → "$3,000" (international thousands grouping; keeps the currency symbol).
+function formatMoney(text) {
+  const sym = (String(text).match(/[$₹]/) || [""])[0];
+  const raw = (String(text).match(/\d[\d,]*/) || [""])[0].replace(/,/g, "");
+  if (!raw) return text;
+  return `${sym}${raw.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+}
+
+// CORE QC PHILOSOPHY: we check the VISIBLE on-screen text, not subtitle-matching.
+// This pass rewrites/drops voiceover-driven findings so the report reflects that:
+//   • numbers with the SAME value → never a factual error (drop, or a soft
+//     formatting suggestion if the caption number is run-together like "$3000");
+//   • audio mismatches about MISSING / EXTRA / incomplete words vs the voiceover
+//     → dropped (captions are intentionally shortened — not our concern).
+// A genuinely WRONG visible word survives (and is tiered as Needs Review).
+function refineFinding(it) {
+  if (!it) return null;
+  const blob = `${it.msg || ""} ${it.why || ""} ${it.fix || ""}`.toLowerCase();
   const capN = parseCaptionNumber(it.captionText);
-  const audN = parseCaptionNumber(it.audioText);   // audioText may hold "char hazar dollar"
-  if (capN == null || audN == null) return false;
-  return capN === audN;   // same numeric meaning → not an error
+  const audN = parseCaptionNumber(it.audioText);
+
+  // ── Numbers: compare VALUE, never force voiceover words onto the screen ──────
+  const numberish = capN != null && (audN != null || /\bnumber|amount|figure|format|comma|thousand|hazar|lakh|crore\b/.test(blob) || /[$₹]/.test(it.captionText || ""));
+  if (numberish) {
+    if (audN != null && capN !== audN) return it;          // genuinely different value → real mistake, keep
+    // same value (or no comparable spoken number): at most a formatting suggestion
+    if (isPoorlyFormattedMoney(it.captionText)) {
+      const pretty = formatMoney(it.captionText);
+      return {
+        ...it, kind: "formatting", checkId: "grammar", severity: "info",
+        confidence: "low", priority: "optional", tier: "style", audioText: null,
+        msg: `Number formatting suggestion: use “${pretty}” instead of “${it.captionText}”`,
+        why: "The amount is correct — this is only a financial-formatting preference, not an error.",
+        fix: `Add thousands separators: “${pretty}” (optional).`,
+      };
+    }
+    return null;                                            // correct value + clean formatting → no issue
+  }
+
+  // ── Audio mismatch about missing/extra/incomplete words → not our concern ────
+  if (it.kind === "audio_mismatch" &&
+      /missing|incomplete|omit|does ?n.?t (show|include|match)|not shown|not on screen|full (line|phrase|sentence)|add .*(caption|on[- ]?screen|to the text)|word order|already (shown|spoken)|extra (word|phrase)|should (include|show|add)|does not (start|begin)/.test(blob)) {
+    return null;
+  }
+  return it;
 }
 
 // ── REDUCER ───────────────────────────────────────────────────────────────────
@@ -1957,7 +1995,8 @@ function reducePlan(plan) {
   const all = [
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
-  ].filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isNumberMatchFalsePositive(it) && !isAllowlisted(it, allow));
+  ].map(refineFinding).filter(Boolean)   // numbers → value-compare/format; drop voiceover-matching noise
+   .filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isAllowlisted(it, allow));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
