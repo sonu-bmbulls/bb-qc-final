@@ -102,6 +102,19 @@ const STT_MODEL = "scribe_v1";    // ElevenLabs Scribe batch model (90+ language
 const AUDIO_SAMPLE_RATE = 16000;  // mono 16kHz is plenty for ASR and keeps WAV small
 const AUDIO_CHUNK_SEC = 90;       // 90s mono-16k WAV ≈ 2.9MB, under Vercel's 4.5MB body cap
 
+// ── Music copyright pre-check (ACRCloud fingerprinting) ───────────────────────
+const MUSIC_URL = "/api/acrcloud/identify";
+const MUSIC_SAMPLE_SEC = 12;      // ACRCloud recommends ~10–15s samples
+const MUSIC_MAX_SAMPLES = 3;      // intro / middle / outro — bounds cost & latency
+const MUSIC_STATUS = {
+  clear:           { label: "No known music match detected", color: "#10b981" },
+  unknown_license: { label: "Music detected — license unknown", color: "#f59e0b" },
+  possible:        { label: "Possible copyrighted music", color: "#f59e0b" },
+  high:            { label: "High copyright risk", color: "#ef4444" },
+  unverified:      { label: "Unable to verify music rights", color: "#94a3b8" },
+};
+const MUSIC_DISCLAIMER = "This is a pre-upload risk check, not a final YouTube copyright decision. YouTube may still detect claims after upload — verify your music license before publishing.";
+
 // ── Animation verification ────────────────────────────────────────────────────
 const VERIFY_WINDOW_SEC = 1.5;    // seconds of frames BEFORE a finding to include when verifying
 const VERIFY_FORWARD_SEC = 6;     // seconds AHEAD to look — captions reveal progressively and lag
@@ -854,6 +867,80 @@ function transcriptWindow(transcript, loTs, hiTs) {
     lines.push(`[${fmtTs(group[0].start)}] ${group.map((w) => w.text).join(" ")}`);
   }
   return lines.join("\n");
+}
+
+// ── Pre-upload music copyright check (ACRCloud) ───────────────────────────────
+// Decodes the audio, samples up to 3 windows (intro / middle / outro), and asks
+// ACRCloud (via our signed serverless proxy) to identify any known commercial
+// track. Returns { status, configured, matches:[{title,artists,album,score,window}] }.
+// Non-fatal: if audio can't be decoded, the proxy isn't configured, or the request
+// fails, it resolves to a benign "unverified" result. NOT YouTube Content ID.
+async function checkMusicCopyright(file, signal) {
+  let rendered;
+  try { rendered = await decodeToMono(file, AUDIO_SAMPLE_RATE); }
+  catch { return { status: "unverified", configured: true, matches: [], note: "Could not decode audio." }; }
+  if (!rendered) return { status: "unverified", configured: true, matches: [], note: "No audio track." };
+
+  const sr = AUDIO_SAMPLE_RATE;
+  const data = rendered.getChannelData(0);
+  const durSec = data.length / sr;
+  const winLen = MUSIC_SAMPLE_SEC * sr;
+
+  // Pick spread-out sample windows (intro/middle/outro), bounded by MUSIC_MAX_SAMPLES.
+  let starts = [];
+  if (durSec <= MUSIC_SAMPLE_SEC + 1) {
+    starts = [0];
+  } else {
+    const n = Math.min(MUSIC_MAX_SAMPLES, Math.max(1, Math.floor(durSec / 18)));
+    for (let i = 0; i < n; i++) {
+      const center = durSec * ((i + 1) / (n + 1));
+      starts.push(Math.max(0, Math.min(data.length - winLen, Math.floor((center - MUSIC_SAMPLE_SEC / 2) * sr))));
+    }
+  }
+  starts = [...new Set(starts)];
+
+  const raw = [];
+  let anyOk = false, configured = true;
+  for (const start of starts) {
+    if (signal?.aborted) break;
+    const slice = data.subarray(start, Math.min(data.length, start + winLen));
+    const buf = await encodeWavMono(slice, sr).arrayBuffer();
+    let res;
+    try { res = await fetch(MUSIC_URL, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: buf, signal }); }
+    catch (e) { if (e.name === "AbortError") break; continue; }
+    if (res.status === 503) { configured = false; break; }   // not set up
+    if (!res.ok) continue;
+    let j; try { j = await res.json(); } catch { continue; }
+    anyOk = true;
+    if (j?.status?.code === 0 && Array.isArray(j?.metadata?.music)) {
+      const startTs = start / sr;
+      for (const m of j.metadata.music.slice(0, 2)) {
+        raw.push({
+          title: m.title || "Unknown title",
+          artists: (m.artists || []).map((a) => a.name).filter(Boolean).join(", ") || "Unknown artist",
+          album: m.album?.name || "",
+          label: m.label || "",
+          score: typeof m.score === "number" ? m.score : null,
+          window: `${fmtTs(startTs)}–${fmtTs(startTs + MUSIC_SAMPLE_SEC)}`,
+        });
+      }
+    }
+  }
+
+  if (!configured) return { status: "unverified", configured: false, matches: [] };
+  if (raw.length === 0) return { status: anyOk ? "clear" : "unverified", configured: true, matches: [] };
+
+  // Dedupe by track, keep the highest score.
+  const byKey = new Map();
+  for (const m of raw) {
+    const k = `${m.title}|${m.artists}`.toLowerCase();
+    const ex = byKey.get(k);
+    if (!ex || (m.score || 0) > (ex.score || 0)) byKey.set(k, m);
+  }
+  const matches = [...byKey.values()].sort((a, b) => (b.score || 0) - (a.score || 0));
+  const top = matches[0].score;
+  const status = top != null && top >= 85 ? "high" : top != null && top >= 60 ? "possible" : "unknown_license";
+  return { status, configured: true, matches };
 }
 
 /**
@@ -3297,6 +3384,58 @@ function AddMissedForm({ defaultTs, onAdd, onClose }) {
   );
 }
 
+// Pre-upload music copyright risk — shown in the QC report (ACRCloud pre-check).
+function MusicRiskPanel({ music }) {
+  if (!music) return null;
+  if (music.configured === false) {
+    return (
+      <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, padding: "12px 16px", display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 14 }}>🎵</span>
+        <span style={{ fontSize: 12.5, color: T.textDim }}>Music copyright check not enabled</span>
+        <InfoDot text="Add ACRCloud keys (ACRCLOUD_HOST / ACCESS_KEY / ACCESS_SECRET) in Vercel to turn on the pre-upload music copyright risk check." />
+      </div>
+    );
+  }
+  const st = MUSIC_STATUS[music.status] || MUSIC_STATUS.unverified;
+  const flagged = music.status === "high" || music.status === "possible" || music.status === "unknown_license";
+  return (
+    <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderLeft: `3px solid ${st.color}`, borderRadius: 14, padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 14 }}>🎵</span>
+        <span style={{ fontSize: 13, fontWeight: 800 }}>Copyright / Music Risk</span>
+        <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 800, letterSpacing: "0.04em", textTransform: "uppercase", padding: "3px 10px", borderRadius: 20, color: st.color, background: `${st.color}1a`, border: `1px solid ${st.color}55` }}>
+          {st.label}
+        </span>
+      </div>
+      {music.matches && music.matches.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "8px 0" }}>
+          {music.matches.map((m, i) => (
+            <div key={i} style={{ fontSize: 12, lineHeight: 1.5, padding: "8px 10px", borderRadius: 9, background: "rgba(255,255,255,0.03)", border: `1px solid ${T.border}` }}>
+              <div><span style={{ color: T.textDim }}>♪ Music detected: </span><strong style={{ color: "white" }}>{m.title}</strong> — {m.artists}</div>
+              <div style={{ color: T.textDim, fontSize: 11, marginTop: 2 }}>
+                {m.album ? `${m.album} · ` : ""}{m.label ? `${m.label} · ` : ""}{m.window}{m.score != null ? ` · confidence ${m.score}%` : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {flagged && (
+        <p style={{ fontSize: 11.5, color: T.redLight, lineHeight: 1.5, margin: "4px 0 0" }}>
+          Suggestion: replace the music or confirm a commercial/YouTube license before uploading.
+        </p>
+      )}
+      {music.status === "clear" && (
+        <p style={{ fontSize: 11.5, color: T.textMute, lineHeight: 1.5, margin: "2px 0 0" }}>
+          No commercial track was matched in the sampled audio.
+        </p>
+      )}
+      <p style={{ fontSize: 10, color: T.textDim, lineHeight: 1.5, marginTop: 10, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
+        {MUSIC_DISCLAIMER}
+      </p>
+    </div>
+  );
+}
+
 function ResultsStage(props) {
   const {
     file, videoUrl, videoRef, seekFromExternal, videoDuration, setVideoDuration,
@@ -3305,7 +3444,7 @@ function ResultsStage(props) {
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
     mistakeCount, reviewCount, styleCount, doneCount,
     overallScore, onNewUpload, onExport, onRecheck, doneIds, toggleDone, briefWasUsed,
-    memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback,
+    memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback, musicRisk,
   } = props;
   const [showMemory, setShowMemory] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -3392,6 +3531,8 @@ function ResultsStage(props) {
               </div>
             </div>
           </div>
+
+          <MusicRiskPanel music={musicRisk} />
 
           <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16, padding: 18 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
@@ -3979,10 +4120,12 @@ export default function App() {
   const [allScans, setAllScans] = useState([]);            // ADMIN: every scan in this browser
   const [feedback, setFeedback] = useState(loadFeedback);  // ADMIN: QC-feedback log
   const [showScanDone, setShowScanDone] = useState(false); // post-scan reminder modal
+  const [musicRisk, setMusicRisk] = useState(null);        // pre-upload music copyright check
   const admin = isAdmin(user);
 
   const fileRef = useRef(null);
   const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
+  const musicRiskRef = useRef(null);                       // latest music-check result (for persistScan)
   const reviewCtxRef = useRef(null);                       // {scanId, owner, fileName} of the report being reviewed
   const wantPlayRef = useRef(false);                       // play from the pre-roll point after an issue click
   const videoRef = useRef(null);
@@ -4044,7 +4187,7 @@ export default function App() {
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     setScanDeadline(null); checkpointRef.current = null; currentScanIdRef.current = null;
-    setShowScanDone(false);
+    setShowScanDone(false); setMusicRisk(null); musicRiskRef.current = null;
     setStage("dashboard");
     if (user) refreshScans(user);
   }, [user, refreshScans]);
@@ -4080,7 +4223,7 @@ export default function App() {
       sizeMb: +((f.size || 0) / 1048576).toFixed(1),
       durationSec: duration, createdAt: Date.now(),
       issues: issuesList, score, errors, warnings, info,
-      briefUsed: briefWasUsed, blob: f,
+      briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, blob: f,
     });
     refreshScans(user);
   }, [user, briefWasUsed, refreshScans]);
@@ -4098,6 +4241,7 @@ export default function App() {
     setIssues(sortByTs(filterAllowlisted(rec.issues || [], loadMemory(user).allow)));
     setVideoDuration(rec.durationSec || 60);
     setBriefWasUsed(!!rec.briefUsed);
+    setMusicRisk(rec.musicRisk || null); musicRiskRef.current = rec.musicRisk || null;
     setDoneIds(new Set(rec.doneIds || []));
     setSelectedIssue(null); setCurrentTs(null);
     setActiveTab("qc_technical"); setActiveFilter("mistake");
@@ -4170,18 +4314,21 @@ export default function App() {
     setShowScanDone(false);
     setCanResume(false);
     setDoneIds(new Set());
+    setMusicRisk(null); musicRiskRef.current = null;
     setBriefWasUsed(briefForThisRun.length > 0);
 
     try {
       setAnalysisPhase("extracting");
       setAnalysisProgress({ current: 0, total: 1 });
-      // Extract frames AND transcribe the voiceover in parallel (both read the
-      // file). Transcription is non-fatal — if there's no audio track or STT
-      // fails, transcript is null and the audio cross-check is simply skipped.
-      const [framesResult, transcript] = await Promise.all([
+      // Extract frames, transcribe the voiceover, AND run the music copyright
+      // pre-check in parallel (all read the file). Transcription + music check are
+      // non-fatal — failures resolve to null / unverified and the scan continues.
+      const [framesResult, transcript, music] = await Promise.all([
         extractFrames(f, cfg.coverageFps, (p) => setAnalysisProgress({ current: p.current, total: p.total })),
         transcribeAudio(f, controller.signal).catch((e) => { console.warn("[BB QC] transcription skipped:", e.message); return null; }),
+        checkMusicCopyright(f, controller.signal).catch((e) => { console.warn("[BB QC] music check skipped:", e.message); return null; }),
       ]);
+      musicRiskRef.current = music; setMusicRisk(music);
       const { frames, duration } = framesResult;
       setVideoDuration(duration);
       if (controller.signal.aborted) return;
@@ -4545,6 +4692,7 @@ export default function App() {
             onAddMissed={addMissed}
             onUnlearn={unlearn}
             onFeedback={admin ? recordFeedback : null}
+            musicRisk={musicRisk}
           />
         )}
         {stage === "admin" && admin && (
