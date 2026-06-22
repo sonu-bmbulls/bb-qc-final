@@ -2369,40 +2369,64 @@ function Countdown({ deadline, capMs }) {
 }
 
 // Speed-mode picker shown on the confirm screen. Two mutually-exclusive cards.
-function ModeSelector({ mode, setMode }) {
+// Clean line icons (premium feel, not chunky unicode symbols).
+function CheckIcon({ color = "currentColor", size = 13 }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><path d="M20 6 9 17l-5-5" /></svg>;
+}
+function XIcon({ color = "currentColor", size = 12 }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><path d="M18 6 6 18M6 6l12 12" /></svg>;
+}
+function ChatIcon({ color = "currentColor", size = 12 }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>;
+}
+
+// Small hover/tap info bubble — keeps explanatory text off the main UI.
+function InfoDot({ text }) {
+  const [show, setShow] = useState(false);
   return (
-    <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
-      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>
-        ⚙️ Speed mode
+    <span
+      style={{ position: "relative", display: "inline-flex", alignItems: "center" }}
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setShow((s) => !s); }}
+    >
+      <span style={{ width: 15, height: 15, borderRadius: "50%", border: `1px solid ${T.border}`, color: T.textDim, fontSize: 9.5, fontStyle: "italic", fontWeight: 700, fontFamily: "Georgia, serif", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "help", lineHeight: 1 }}>i</span>
+      {show && (
+        <span style={{ position: "absolute", bottom: "135%", left: "50%", transform: "translateX(-50%)", width: 210, padding: "8px 11px", borderRadius: 9, background: "#221a1e", border: `1px solid ${T.border}`, color: T.textMute, fontSize: 11, lineHeight: 1.5, fontWeight: 500, textTransform: "none", letterSpacing: 0, zIndex: 70, boxShadow: "0 10px 28px rgba(0,0,0,0.55)", pointerEvents: "none", textAlign: "left" }}>{text}</span>
+      )}
+    </span>
+  );
+}
+
+// Compact, premium pick-cards: icon + label + info dot only. Details on hover.
+function PickCards({ icon, title, options, value, onChange, cols = 2 }) {
+  return (
+    <div style={{ width: "100%", maxWidth: 540, marginBottom: 18 }}>
+      <div style={{ fontSize: 10.5, color: T.textDim, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 9 }}>
+        {icon} {title}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        {Object.values(MODES).map((m) => {
-          const active = mode === m.id;
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, 1fr)`, gap: 10 }}>
+        {options.map((o) => {
+          const active = value === o.id;
           return (
             <button
-              key={m.id}
+              key={o.id}
               type="button"
-              onClick={() => setMode(m.id)}
+              onClick={() => onChange(o.id)}
               style={{
-                textAlign: "left",
-                padding: "14px 16px",
-                borderRadius: 12,
-                cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 9, padding: "13px 14px", borderRadius: 12, cursor: "pointer",
                 background: active ? T.redTint : "rgba(255,255,255,0.025)",
                 border: `1px solid ${active ? T.borderHot : T.border}`,
-                boxShadow: active ? "0 4px 16px rgba(220,38,38,0.18)" : "none",
+                boxShadow: active ? "0 4px 16px rgba(220,38,38,0.15)" : "none",
                 transition: "all 0.15s",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 18 }}>{m.icon}</span>
-                <span style={{ fontSize: 14, fontWeight: 800, color: active ? "white" : T.textMute }}>{m.label}</span>
-                {active && <span style={{ marginLeft: "auto", fontSize: 11, color: T.redLight }}>✓</span>}
-              </div>
-              <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>{m.blurb}</p>
-              <p style={{ fontSize: 10, color: T.textDim, marginTop: 8, fontFamily: "DM Mono, monospace" }}>
-                {m.model.replace("claude-", "")} · {m.coverageFps} fps · {m.runCreative ? "full audit" : "objective only"}
-              </p>
+              <span style={{ fontSize: 16 }}>{o.icon}</span>
+              <span style={{ fontSize: 13, fontWeight: 700, color: active ? "white" : T.textMute }}>{o.label}</span>
+              <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 7 }}>
+                {active && <span style={{ fontSize: 11, color: T.redLight }}>✓</span>}
+                <InfoDot text={o.tip} />
+              </span>
             </button>
           );
         })}
@@ -2411,45 +2435,52 @@ function ModeSelector({ mode, setMode }) {
   );
 }
 
+function ModeSelector({ mode, setMode }) {
+  const options = Object.values(MODES).map((m) => ({
+    id: m.id, icon: m.icon, label: m.label,
+    tip: `${m.blurb} (${m.model.replace("claude-", "")} · ${m.coverageFps} fps).`,
+  }));
+  return <PickCards icon="⚙️" title="Speed mode" options={options} value={mode} onChange={setMode} />;
+}
+
 // Text-scope toggle: QC only the caption/subtitle layer (default) or every piece
-// of on-screen text. Default avoids false errors from iPad notes, whiteboards,
-// slide text and other incidental in-shot text.
+// of on-screen text. Default avoids false errors from incidental in-shot text.
 function ScopeSelector({ scopeMode, setScopeMode }) {
-  const opts = [
-    { id: "captions", icon: "💬", label: "Check only captions", blurb: "Subtitles & title overlays only — ignores iPad notes, whiteboards, slides, app UI & background text" },
-    { id: "all",      icon: "🔍", label: "Check all on-screen text", blurb: "Also QCs handwriting, whiteboards, documents & every other visible word" },
+  const options = [
+    { id: "captions", icon: "💬", label: "Only captions", tip: "Subtitles & title overlays only — ignores iPad notes, whiteboards, slides, app UI and background text." },
+    { id: "all", icon: "🔍", label: "All on-screen text", tip: "Also QCs handwriting, whiteboards, documents and every other visible word in the frame." },
   ];
+  return <PickCards icon="🎯" title="Text scope" options={options} value={scopeMode} onChange={setScopeMode} />;
+}
+
+// Collapsible help — keeps detailed explanations off the main screen.
+const FAQ_ITEMS = [
+  { q: "How does BB QC Labs work?", a: "Upload a video, choose a scan type, and start. We check every frame's on-screen text for spelling, grammar, trading terms, numbers and brand mistakes, then give you a clean report to review." },
+  { q: "What is Urgent Pass?", a: "A fast, low-cost scan for objective visible-text errors — spelling, grammar and safe-zones." },
+  { q: "What is Deep Audit?", a: "Everything in Urgent Pass plus creative & retention feedback (hooks, pacing, branding). Slower and slightly pricier." },
+  { q: "“Only captions” vs “All on-screen text”?", a: "“Only captions” reviews just the subtitle/title overlays the editor added and ignores iPad notes, whiteboards, slides and background text. “All on-screen text” reviews every visible word." },
+  { q: "What is the Magic Prompt?", a: "An optional brief — paste your script, brand terms or specific checks and QC cross-references the video against them." },
+  { q: "What does Retention Mode do?", a: "A preset that focuses the audit on hooks, pacing and watch-time retention." },
+  { q: "How does QC feedback improve results?", a: "When you mark something “Not an issue” or add a missed one, QC remembers it and applies it on future scans — like a custom dictionary." },
+];
+function HelpFAQ() {
+  const [open, setOpen] = useState(false);
   return (
-    <div style={{ width: "100%", maxWidth: 540, marginBottom: 20 }}>
-      <div style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>
-        🎯 Text scope
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        {opts.map((o) => {
-          const active = scopeMode === o.id;
-          return (
-            <button
-              key={o.id}
-              type="button"
-              onClick={() => setScopeMode(o.id)}
-              style={{
-                textAlign: "left", padding: "14px 16px", borderRadius: 12, cursor: "pointer",
-                background: active ? T.redTint : "rgba(255,255,255,0.025)",
-                border: `1px solid ${active ? T.borderHot : T.border}`,
-                boxShadow: active ? "0 4px 16px rgba(220,38,38,0.18)" : "none",
-                transition: "all 0.15s",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 16 }}>{o.icon}</span>
-                <span style={{ fontSize: 13, fontWeight: 800, color: active ? "white" : T.textMute }}>{o.label}</span>
-                {active && <span style={{ marginLeft: "auto", fontSize: 11, color: T.redLight }}>✓</span>}
-              </div>
-              <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>{o.blurb}</p>
-            </button>
-          );
-        })}
-      </div>
+    <div style={{ width: "100%", maxWidth: 540, marginTop: 26 }}>
+      <button onClick={() => setOpen((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: T.textDim, fontSize: 12, fontWeight: 600, background: "none", padding: "6px 0" }}>
+        <span style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s", display: "inline-block" }}>▸</span>
+        Help &amp; FAQ
+      </button>
+      {open && (
+        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+          {FAQ_ITEMS.map((f, i) => (
+            <details key={i} style={{ background: "rgba(255,255,255,0.02)", border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 13px" }}>
+              <summary style={{ cursor: "pointer", fontSize: 12.5, fontWeight: 600, color: "white", listStyle: "none" }}>{f.q}</summary>
+              <p style={{ fontSize: 12, color: T.textMute, lineHeight: 1.55, marginTop: 7 }}>{f.a}</p>
+            </details>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2547,6 +2578,7 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
   const [fbType, setFbType] = useState(null);
   const [fbNote, setFbNote] = useState("");
   const [fbSent, setFbSent] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
   const s = SEV[issue.severity];
   const check = CHECKS.find(c => c.id === issue.checkId);
   const isCreative = issue.category === "creative_retention";
@@ -2641,43 +2673,54 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
             <span style={{ color: "rgba(255,255,255,0.85)" }}>“{issue.audioText}”</span>
           </p>
         )}
-        {issue.why && (
-          <p style={{ fontSize: 11, lineHeight: 1.5, margin: 0, color: T.textMute }}>
-            <span style={{ color: T.textDim }}>Why: </span>{issue.why}
-          </p>
-        )}
         {issue.fix && (
           <p style={{ fontSize: 11, lineHeight: 1.5, margin: 0, color: T.redLight }}>
             <span style={{ color: T.textDim }}>Fix: </span>{issue.fix}
           </p>
         )}
+        {issue.why && (
+          <div style={{ marginTop: 1 }}>
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowWhy((v) => !v); }}
+              style={{ fontSize: 10.5, color: T.textDim, cursor: "pointer", background: "none", fontWeight: 600, padding: 0, display: "inline-flex", alignItems: "center", gap: 4 }}
+            >
+              <span style={{ transform: showWhy ? "rotate(90deg)" : "none", transition: "transform 0.15s", display: "inline-block" }}>▸</span>
+              Why?
+            </button>
+            {showWhy && (
+              <p style={{ fontSize: 11, lineHeight: 1.5, margin: "4px 0 0", color: T.textMute }}>{issue.why}</p>
+            )}
+          </div>
+        )}
       </div>
       {onToggleDone && (
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 11, alignItems: "center" }}>
           <button
             onClick={(e) => { e.stopPropagation(); onToggleDone(issue.id); }}
             style={{
-              padding: "6px 12px", borderRadius: 8, cursor: "pointer",
+              padding: "6px 13px", borderRadius: 20, cursor: "pointer",
               border: `1px solid ${isDone ? "rgba(16,185,129,0.5)" : T.border}`,
-              background: isDone ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.04)",
-              color: isDone ? "#34d399" : T.textMute, fontSize: 11, fontWeight: 700,
-              display: "inline-flex", alignItems: "center", gap: 6,
+              background: isDone ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.03)",
+              color: isDone ? "#34d399" : T.textMute, fontSize: 11.5, fontWeight: 600,
+              display: "inline-flex", alignItems: "center", gap: 6, transition: "all 0.15s",
             }}
           >
-            {isDone ? "✓ Done — reopen" : "✓ Mark done"}
+            {isDone
+              ? <><CheckIcon color="#34d399" /> Fixed · undo</>
+              : <><CheckIcon color={T.textDim} /> Mark as fixed</>}
           </button>
           {onLearnCorrect && !isCreative && !learning && (
             <button
               onClick={(e) => { e.stopPropagation(); setTerm(issue.captionText || ""); setLearning(true); }}
-              title="Tell the AI this is actually correct — it won't flag this word again on any video"
+              title="Tell QC this is actually correct — it won't flag this word again on any video"
               style={{
-                padding: "6px 12px", borderRadius: 8, cursor: "pointer",
-                border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.04)",
-                color: T.textMute, fontSize: 11, fontWeight: 700,
-                display: "inline-flex", alignItems: "center", gap: 6,
+                padding: "6px 13px", borderRadius: 20, cursor: "pointer",
+                border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.03)",
+                color: T.textMute, fontSize: 11.5, fontWeight: 600,
+                display: "inline-flex", alignItems: "center", gap: 6, transition: "all 0.15s",
               }}
             >
-              ✗ Not an error — learn
+              <XIcon color={T.textDim} /> Not an issue
             </button>
           )}
         </div>
@@ -2713,14 +2756,14 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
       )}
       {onFeedback && !isCreative && (
         fbSent ? (
-          <p style={{ marginTop: 8, fontSize: 10.5, color: "#34d399", fontWeight: 700 }}>✓ Feedback logged for QC review</p>
+          <p style={{ marginTop: 8, fontSize: 10.5, color: "#34d399", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}><CheckIcon color="#34d399" size={12} /> Feedback sent for QC review</p>
         ) : !fbOpen ? (
           <button
             onClick={(e) => { e.stopPropagation(); setFbOpen(true); }}
             title="Admin: rate this finding to improve QC"
-            style={{ marginTop: 8, padding: "5px 10px", borderRadius: 8, cursor: "pointer", border: `1px dashed ${T.border}`, background: "rgba(255,255,255,0.03)", color: T.textDim, fontSize: 10.5, fontWeight: 700 }}
+            style={{ marginTop: 8, padding: "5px 12px", borderRadius: 20, cursor: "pointer", border: `1px solid ${T.border}`, background: "rgba(255,255,255,0.03)", color: T.textDim, fontSize: 11, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6 }}
           >
-            ⚑ QC feedback
+            <ChatIcon color={T.textDim} /> Send feedback
           </button>
         ) : (
           <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 8, padding: 10, borderRadius: 8, background: "rgba(168,85,247,0.06)", border: "1px solid rgba(168,85,247,0.3)" }}>
@@ -2906,10 +2949,11 @@ function Stat({ label, value, highlight }) {
   );
 }
 
-function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId, mode, setMode, scopeMode, setScopeMode }) {
+function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setReferenceBrief, activePresetId, setActivePresetId, mode, setMode, scopeMode, setScopeMode, admin }) {
   const briefChars = referenceBrief.length;
   const briefLimit = 4000;
   const sizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : "0";
+  const [showCostDetail, setShowCostDetail] = useState(false);
 
   // Video metadata (read from the preview element) → live cost estimate.
   const [meta, setMeta] = useState({ duration: 0, w: 0, h: 0 });
@@ -2964,37 +3008,38 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
       {/* ── Text-scope selector (captions only vs all on-screen text) ──────── */}
       <ScopeSelector scopeMode={scopeMode} setScopeMode={setScopeMode} />
 
-      {/* ── Cost calculator ──────────────────────────────────────────────── */}
-      <div style={{ width: "100%", maxWidth: 540, marginBottom: 20, padding: "14px 16px", borderRadius: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.25)" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <span style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>💰 Estimated cost of this scan</span>
-          <span style={{ fontSize: 10, color: T.textDim }}>{MODES[mode].label} · {MODES[mode].model.replace("claude-", "")} · ${MODES[mode].priceIn}/M in · ${MODES[mode].priceOut}/M out</span>
+      {/* ── Estimated cost — one clean line (technical detail behind admin) ── */}
+      <div style={{ width: "100%", maxWidth: 540, marginBottom: 18, padding: "13px 16px", borderRadius: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.25)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, color: T.textMute, fontWeight: 600 }}>Estimated scan cost</span>
+          <InfoDot text="Cost depends on video length and scan mode. Charged to your Anthropic credit." />
+          <span style={{ marginLeft: "auto", fontSize: 18, fontWeight: 800, color: "#34d399", fontFamily: "DM Mono, monospace" }}>
+            {est ? `$${est.cost.toFixed(2)}` : "…"}
+          </span>
         </div>
-        {est ? (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 10 }}>
-              <Stat label="Frames scanned" value={est.frames} />
-              <Stat label="API calls" value={est.calls} />
-              <Stat label="Input tokens" value={`~${(est.inputTokens / 1000).toFixed(0)}K`} />
-              <Stat label="Est. cost" value={`$${est.cost.toFixed(2)}`} highlight />
-            </div>
-            <p style={{ fontSize: 11, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-              ≈ <strong style={{ color: "white" }}>${est.cost.toFixed(2)}</strong> for this video ({est.frames} frames at {est.tokensPerImage} tokens each, across {est.calls} batched calls). Real cost varies with how many findings come back. This is deducted from your Anthropic credit.
-            </p>
-          </>
-        ) : (
-          <p style={{ fontSize: 12, color: T.textDim, margin: 0 }}>Reading video length to estimate cost…</p>
+        {admin && est && (
+          <div style={{ marginTop: 8, borderTop: `1px solid ${T.border}`, paddingTop: 8 }}>
+            <button onClick={() => setShowCostDetail((v) => !v)} style={{ fontSize: 10.5, color: T.textDim, cursor: "pointer", background: "none", fontWeight: 600 }}>
+              {showCostDetail ? "▾" : "▸"} admin · debug breakdown
+            </button>
+            {showCostDetail && (
+              <p style={{ fontSize: 10.5, color: T.textDim, lineHeight: 1.5, marginTop: 6, fontFamily: "DM Mono, monospace" }}>
+                {MODES[mode].model.replace("claude-", "")} · {est.frames} frames @ {est.tokensPerImage} tok · {est.calls} calls · ~{(est.inputTokens / 1000).toFixed(0)}K in · ${MODES[mode].priceIn}/M in · ${MODES[mode].priceOut}/M out
+              </p>
+            )}
+          </div>
         )}
       </div>
 
-      {/* ── Magic prompt tool: Reference Brief / Script / Editor Notes ─────── */}
+      {/* ── Magic prompt (optional brief) ──────────────────────────────────── */}
       <div style={{ width: "100%", maxWidth: 540 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <label htmlFor="ref-brief" style={{ fontSize: 11, color: T.textMute, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-            ✨ Magic Prompt · Brief / Script / Notes
-            <span style={{ color: T.textDim, fontWeight: 500, letterSpacing: "0.02em", textTransform: "none", marginLeft: 6 }}>· optional</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+          <label htmlFor="ref-brief" style={{ fontSize: 10.5, color: T.textDim, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            ✨ Magic Prompt
           </label>
-          <span style={{ fontSize: 10, color: briefChars > briefLimit ? T.redBright : T.textDim, fontFamily: "DM Mono, monospace" }}>
+          <span style={{ fontSize: 10.5, color: T.textDim, textTransform: "none", letterSpacing: 0 }}>· optional</span>
+          <InfoDot text="Paste your script, brand terms or specific checks and QC will cross-reference the video against them. Or tap a preset." />
+          <span style={{ marginLeft: "auto", fontSize: 10, color: briefChars > briefLimit ? T.redBright : T.textDim, fontFamily: "DM Mono, monospace" }}>
             {briefChars}/{briefLimit}
           </span>
         </div>
@@ -3013,25 +3058,19 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
             const match = PRESETS.find(p => p.text === e.target.value);
             setActivePresetId(match ? match.id : null);
           }}
-          rows={5}
-          placeholder={`Paste your script, brand guidelines, or specific checks here. Or tap a preset above.`}
+          rows={4}
+          placeholder={`Script, brand terms, or specific checks (optional)…`}
           style={{
             width: "100%", padding: "12px 14px", borderRadius: 10,
             background: "rgba(255,255,255,0.025)",
             border: `1px solid ${referenceBrief ? T.borderHot : T.border}`,
             color: "white", fontSize: 12, fontFamily: "DM Sans, sans-serif",
-            lineHeight: 1.55, resize: "vertical", minHeight: 110, outline: "none",
+            lineHeight: 1.55, resize: "vertical", minHeight: 92, outline: "none",
             transition: "border-color 0.2s", boxSizing: "border-box",
           }}
           onFocus={(e) => { e.target.style.borderColor = T.red; }}
           onBlur={(e) => { e.target.style.borderColor = referenceBrief ? T.borderHot : T.border; }}
         />
-        <p style={{ fontSize: 11, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
-          {referenceBrief
-            ? <>✓ Claude will cross-reference the video against these instructions and perform an exhaustive pass.</>
-            : <>If provided, Claude will strictly audit the video against these requirements — wrong prices, missing brand terms, off-script copy, etc.</>
-          }
-        </p>
       </div>
 
       {/* Actions */}
@@ -3058,9 +3097,8 @@ function ConfirmStage({ file, videoUrl, onStart, onBack, referenceBrief, setRefe
           ▶ Start QC Scan
         </button>
       </div>
-      <p style={{ fontSize: 11, color: T.textMute, marginTop: 12, textAlign: "center", maxWidth: 540 }}>
-        Exhaustive mode: every distinct frame is scanned across many batched calls. A longer clip can take a few minutes — that's the cost of missing nothing.
-      </p>
+
+      <HelpFAQ />
     </div>
   );
 }
@@ -3078,9 +3116,9 @@ function PhaseRow({ done, active, label }) {
 
 function AnalyzingStage({ file, phase, progress, error, onCancel, deadline, capMs }) {
   const phaseLabels = {
-    extracting: { title: "Extracting frames", subtitle: "Densely sampling the video so no on-screen text is missed" },
-    analyzing:  { title: "Analyzing with Claude vision", subtitle: "Scanning every frame across batched calls — this can take a few minutes" },
-    finalizing: { title: "Compiling report",  subtitle: "Merging duplicate findings and sorting by timestamp" },
+    extracting: { title: "Preparing your video…", subtitle: "Getting your video ready for review" },
+    analyzing:  { title: "Checking your video quality…", subtitle: "Reviewing captions and visible text — this can take a moment" },
+    finalizing: { title: "Finalizing your QC report…",  subtitle: "Almost done — tidying up the results" },
   };
   const current = phaseLabels[phase] || phaseLabels.extracting;
   const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
@@ -4458,6 +4496,7 @@ export default function App() {
             setMode={setMode}
             scopeMode={scopeMode}
             setScopeMode={setScopeMode}
+            admin={admin}
           />
         )}
         {stage === "analyzing" && (
