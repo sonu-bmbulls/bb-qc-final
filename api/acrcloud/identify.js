@@ -12,7 +12,10 @@
 //   ACRCLOUD_ACCESS_KEY
 //   ACRCLOUD_ACCESS_SECRET
 // Until all three are set, this returns 503 not_configured and the UI shows
-// "music check not enabled" — exactly like the ElevenLabs flow.
+// "music check not enabled".
+//
+// NOTE: uses raw `res.statusCode` + `res.end()` (not res.status()/.json()/.send())
+// — those Vercel helpers threw "invalid parameter format" on this runtime here.
 // ═════════════════════════════════════════════════════════════════════════════
 
 import crypto from "crypto";
@@ -23,10 +26,16 @@ export const config = {
   maxDuration: 30,
 };
 
+function send(res, code, obj) {
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json");
+  res.end(typeof obj === "string" ? obj : JSON.stringify(obj));
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-    return res.status(405).json({ error: { type: "method_not_allowed", message: "Only POST is supported" } });
+    return send(res, 405, { error: { type: "method_not_allowed", message: "Only POST is supported" } });
   }
 
   const clean = (v) => (v || "").trim().replace(/^["']|["']$/g, "");
@@ -37,7 +46,7 @@ export default async function handler(req, res) {
   const accessSecret = clean(process.env.ACRCLOUD_ACCESS_SECRET);
 
   if (!host || !accessKey || !accessSecret) {
-    return res.status(503).json({
+    return send(res, 503, {
       error: {
         type: "not_configured",
         message:
@@ -51,7 +60,7 @@ export default async function handler(req, res) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const sample = Buffer.concat(chunks);
-    if (!sample.length) return res.status(400).json({ error: { type: "bad_request", message: "Empty audio sample." } });
+    if (!sample.length) return send(res, 400, { error: { type: "bad_request", message: "Empty audio sample." } });
 
     const ts = Math.floor(Date.now() / 1000).toString();
     const stringToSign = ["POST", "/v1/identify", accessKey, "audio", "1", ts].join("\n");
@@ -77,11 +86,9 @@ export default async function handler(req, res) {
       body,
     });
     const text = await upstream.text();
-    res.status(upstream.status);
-    res.setHeader("Content-Type", upstream.headers.get("content-type") || "application/json");
-    return res.send(text);
+    return send(res, upstream.status || 200, text);
   } catch (e) {
     console.error("[api/acrcloud] upstream error:", e);
-    return res.status(502).json({ error: { type: "proxy_error", message: "Failed to reach ACRCloud: " + e.message } });
+    return send(res, 502, { error: { type: "proxy_error", message: "Failed to reach ACRCloud: " + (e && e.message) } });
   }
 }
