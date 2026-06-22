@@ -1170,6 +1170,17 @@ line. That is normal and CORRECT. Therefore:
     meaning rules out (e.g. "mazboor" where "mazboot" is clearly intended), flag
     it as kind "spelling" — judged from the visible text, not from the audio.
 
+THINK LIKE AN EDITOR — these are INTENTIONAL and CORRECT, never "missing" errors:
+  1. KEYWORD EMPHASIS — only one strong word is shown ("POWER", "BREAKOUT", "RISK",
+     "PROFIT") while the voiceover speaks a whole sentence. Correct by design.
+  2. SHORTENED CAPTIONS — the editor shows a trimmed version of the spoken line.
+  3. PROGRESSIVE FLOW — the sentence is split across frames; this slice shows part.
+  4. LONG-HELD EMPHASIS — one word/phrase stays on screen while the VO continues.
+  5. DESIGN OVERLAY — big styled text for impact, not a subtitle.
+  For ALL of these: if the visible word(s) are spelled right and make sense, emit
+  NOTHING. Example: VO "I have the power to change this result", caption "POWER" →
+  check only that "POWER" is correct → it is → NO finding. Never say "missing words".
+
 NUMBERS — COMPARE THE VALUE, NEVER THE FORMATTING:
   Same numeric VALUE = correct, regardless of spoken words or commas:
     • "$4000" = "$4,000" = "char hazar" = "four thousand" = 4,000  → all equal.
@@ -1946,6 +1957,17 @@ function formatMoney(text) {
   return `${sym}${raw.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
 }
 
+// True when the on-screen caption is a strict, correct SUBSET of the spoken line
+// (every caption word appears in the audio, and the caption is shorter). That is
+// keyword-emphasis / shortening — intentional editing, never a "missing" error.
+function captionIsSubsetOfAudio(it) {
+  const words = (s) => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const cap = words(it.captionText);
+  const aud = new Set(words(it.audioText));
+  if (cap.length === 0 || aud.size === 0 || cap.length >= aud.size) return false;
+  return cap.every((w) => aud.has(w));
+}
+
 // CORE QC PHILOSOPHY: we check the VISIBLE on-screen text, not subtitle-matching.
 // This pass rewrites/drops voiceover-driven findings so the report reflects that:
 //   • numbers with the SAME value → never a factual error (drop, or a soft
@@ -1977,10 +1999,21 @@ function refineFinding(it) {
     return null;                                            // correct value + clean formatting → no issue
   }
 
-  // ── Audio mismatch about missing/extra/incomplete words → not our concern ────
-  if (it.kind === "audio_mismatch" &&
-      /missing|incomplete|omit|does ?n.?t (show|include|match)|not shown|not on screen|full (line|phrase|sentence)|add .*(caption|on[- ]?screen|to the text)|word order|already (shown|spoken)|extra (word|phrase)|should (include|show|add)|does not (start|begin)/.test(blob)) {
-    return null;
+  // ── EDITOR INTENT: the caption may intentionally show only PART of the spoken
+  //    line — keyword emphasis ("POWER"), shortening, progressive flow, long-held
+  //    emphasis. None of these are errors. Drop any finding whose complaint is
+  //    line-level (the caption is shorter than / missing words from the voiceover).
+  //    NB: letter-level "missing/extra letter" (a real spelling defect) is NOT
+  //    matched here — that alternation is word/phrase/line-level only.
+  const lineLevelMissing = /missing (word|words|phrase|line|text)|spoken (word|words|line|phrase|sentence)|full (line|sentence|phrase|voiceover|caption)|add .*(to the )?(caption|on[- ]?screen|text)|shorter than|rest of the (sentence|line|phrase)|does ?n.?t (show|include|contain) the (full|whole|complete|rest)|only (shows?|displays?) (the )?(keyword|one word|single word|first|part)|caption (is )?(incomplete|shorter|truncated vs)|not (shown|present) on[- ]?screen|missing from (the )?(caption|screen|on[- ]?screen)/.test(blob);
+  if (lineLevelMissing) return null;
+
+  if (it.kind === "audio_mismatch") {
+    // A caption that is a correct SUBSET of the audio = intentional emphasis /
+    // shortening → not an error.
+    if (captionIsSubsetOfAudio(it)) return null;
+    if (/missing|incomplete|omit|not shown|word order|already (shown|spoken)|extra (word|phrase)|does not (start|begin)/.test(blob)) return null;
+    // else: a genuinely WRONG visible word framed as audio_mismatch → keep (issueTier caps it at Needs Review).
   }
   return it;
 }
