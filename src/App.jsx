@@ -199,6 +199,7 @@ function isCapitalizationFinding(it) {
 // the model's own tier so the user's specific complaints are always honored.
 function issueTier(it) {
   if (!it) return "review";
+  if (it.forcedTier && VALID_TIER.has(it.forcedTier)) return it.forcedTier;   // verification override
   if (it.category === "creative_retention") return it.tier && VALID_TIER.has(it.tier) ? it.tier : "review";
   // 1) STYLE — capitalization, number formatting, romanization variants, consistency
   if (it.kind === "consistency" || it.kind === "formatting") return "style";
@@ -1284,6 +1285,38 @@ ORDINAL NUMBERS — these ARE real visible-text mistakes (flag as "spelling"):
   Wrong ordinal suffixes are objective errors visible on screen.
 
 ═══════════════════════════════════════════════════════════════════════════
+NAMED ENTITIES — VERIFY THE REAL NAME, DON'T SOUND-CORRECT (HIGH STAKES)
+═══════════════════════════════════════════════════════════════════════════
+Company / brand / person / place / port / project / stock / fund names are the
+MOST damaging to get wrong — and the trickiest. Treat them specially:
+  • Use the video's TOPIC (transcript context) + your own real-world knowledge to
+    work out the REAL entity (e.g. an Adani ports/infrastructure video → the real
+    project is "Vizhinjam International Seaport"). Correct toward the REAL name.
+  • NEVER "correct" an entity to match how the VOICEOVER SOUNDS. The voiceover is
+    pronunciation, not spelling. e.g. caption "Vizhinjamin International" → do NOT
+    suggest the soundalike "Vizhindham"; the likely real name is "Vizhinjam
+    International Seaport" — say that, and ask the editor to verify.
+  • CONFIDENCE GATES THE TIER:
+      – You clearly know the real name and the caption is wrong → "error",
+        confidence "high" (Actual Mistake). msg: Named-entity error: "<shown>" →
+        "<real name>".
+      – You suspect a real entity but aren't certain of the exact name →
+        confidence "medium" (Needs Review). Phrase it as: Possible named-entity
+        issue: "<shown>" may be "<likely entity>" — please verify against source.
+      – You can't reliably identify the real entity → DO NOT GUESS. Emit nothing.
+
+ENGLISH WORDS ARE NOT TYPOS JUST BECAUSE THE VO IS HINGLISH:
+  • A correctly-spelled English word is CORRECT even if the voiceover pronounces it
+    in Hinglish. Do NOT "fix" it to the spoken sound. e.g. caption "villain" with
+    VO "villen" → "villain" is the correct English spelling → emit NOTHING. Same
+    for manager, target, breakout, international, etc.
+
+NEVER EMIT A "NO-CHANGE" FINDING:
+  • If the caption is already correct, or your fix would be the SAME text that is
+    already on screen, or your fix is "no action required / no change needed" —
+    emit NOTHING. Do NOT output a finding whose fix equals the current text.
+
+═══════════════════════════════════════════════════════════════════════════
 HINGLISH PHONETIC CONFUSIONS — CHECK THESE EVERY TIME
 ═══════════════════════════════════════════════════════════════════════════
 These near-identical Hinglish pairs change MEANING. Whenever the VISIBLE caption
@@ -1964,7 +1997,33 @@ function isProgressiveCaptionFalsePositive(it) {
 // not findings (e.g. "caption matches audio", "correct Hinglish, no fix required").
 function isNonIssue(it) {
   const m = `${it.msg || ""} ${it.fix || ""} ${it.why || ""}`.toLowerCase();
-  return /no change required|no fix required|no error detected|caption is correct|is correct hinglish|already correct|matches the voiceover|caption matches audio|caption is grammatically sound|no change needed|correct as[- ]is/.test(m);
+  return /no change required|no fix required|no error detected|caption is correct|is correct hinglish|already correct|matches the voiceover|caption matches audio|caption is grammatically sound|no change needed|no action (required|needed)|no correction needed|correct as[- ](is|written)|text is correct|already (the )?correct|spelled correctly/.test(m);
+}
+
+// Parse a "Change 'X' to 'Y'" / 'change "X" to "Y"' fix into { from, to }.
+function parseFixPair(fix) {
+  if (!fix) return null;
+  const q = [...fix.matchAll(/[“"']([^“”"']{1,120})[”"']/g)].map((x) => x[1]);
+  if (q.length >= 2) return { from: q[0], to: q[1] };
+  const m = fix.match(/\bto\b\s+[“"']?([^“”"']{1,120})[”"']?\s*$/i);
+  if (m) return { from: null, to: m[1].trim() };
+  return null;
+}
+// A no-op finding: the suggested fix equals the text already on screen (so there
+// is nothing to change), or the corrected form is ALREADY visible in the caption
+// and the wrong form is not. Catches "shown as error but no action required" and
+// "re-flagging a word the editor already corrected".
+function isNoOpFix(it) {
+  const pair = parseFixPair(it.fix);
+  if (!pair) return false;
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  const to = norm(pair.to), from = norm(pair.from), cap = ` ${norm(it.captionText)} `;
+  if (!to) return false;
+  const word = (w) => w && new RegExp(`(^|[^a-z0-9])${reEsc(w)}([^a-z0-9]|$)`).test(cap);
+  if (from && from === to) return true;                 // "change X to X"
+  if (norm(it.captionText) === to) return true;          // whole caption already == target
+  if (word(to) && from && !word(from)) return true;      // corrected form present, wrong form gone
+  return false;
 }
 
 // ── Hindi/Hinglish number normalization ───────────────────────────────────────
@@ -2116,7 +2175,7 @@ function reducePlan(plan) {
     ...plan.segments.flatMap((s) => s.issues || []),
     ...(plan.creativeIssues || []),
   ].map(refineFinding).filter(Boolean)   // numbers → value-compare/format; drop voiceover-matching noise
-   .filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isSoftNonActionable(it) && !isAllowlisted(it, allow));
+   .filter((it) => !isProgressiveCaptionFalsePositive(it) && !isNonIssue(it) && !isNoOpFix(it) && !isSoftNonActionable(it) && !isAllowlisted(it, allow));
   const merged = dedupeIssues(all);
   merged.sort((a, b) => {
     if (a.ts == null && b.ts == null) return 0;
@@ -2277,6 +2336,18 @@ function isOcrSuspect(it) {
   if (hasRepeatedRun(it.captionText)) return true;
   return false;
 }
+// Any would-be ACTUAL MISTAKE on visible text gets a stable-frame double-check
+// before it's confirmed — this is the catch-all against animation/transition
+// misreads. Bounded to mistake-tier (so we don't verify everything).
+const VERIFY_KINDS = new Set(["spelling", "grammar", "caps", "truncation", "consistency"]);
+function needsStableVerify(it) {
+  if (!it || it.category === "creative_retention") return false;
+  if (!VERIFY_KINDS.has(it.kind)) return false;
+  // Trading-term errors (BREAK OUT→BREAKOUT) are word-form, not OCR misreads —
+  // frame-verifying them risks wrongly demoting a confirmed glossary mistake.
+  if (matchTradingTerm(it.captionText, `${it.msg || ""} ${it.fix || ""}`)) return false;
+  return issueTier(it) === "mistake";
+}
 
 async function verifyFinding(it, frames, transcript, signal, opts = {}) {
   const model = opts.model || DEFAULT_MODEL;
@@ -2287,7 +2358,7 @@ async function verifyFinding(it, frames, transcript, signal, opts = {}) {
   if (window.length > 12) window = sampleEvenly(window, 12);
 
   const audio = transcript ? transcriptWindow(transcript, lo, hi) : "";
-  const ocrMode = isOcrSuspect(it);
+  const ocrMode = !isAnimationSuspect(it);   // OCR/stable-read prompt for everything except truncation/reveal
   const promptText = ocrMode
     ? `These ${window.length} frames are in chronological order, spanning ${fmtTs(lo)}–${fmtTs(hi)}. A previous QC pass flagged a SPELLING error here at ${fmtTs(ts)}:
 
@@ -2339,9 +2410,11 @@ Return ONLY this JSON, nothing else:
 // out to be mid-animation reveals, refine the ones that are real, renumber ids.
 async function verifyAnimationSuspects(issues, plan, signal, onProgress = () => {}) {
   const model = (MODES[plan.modeId] || MODES[DEFAULT_MODE]).model;
-  // Verify both classes against neighbouring frames: animation/truncation reveals
-  // AND OCR doubled-letter misreads of stylized captions ("PATTERN"→"PATTTERN").
-  const suspects = issues.filter((it) => isAnimationSuspect(it) || isOcrSuspect(it));
+  // Stable-frame double-check, three classes against neighbouring frames:
+  //   • animation/truncation reveals,
+  //   • OCR doubled-letter misreads of stylized captions ("PATTERN"→"PATTTERN"),
+  //   • every other would-be ACTUAL MISTAKE on visible text (catch-all).
+  const suspects = issues.filter((it) => isAnimationSuspect(it) || isOcrSuspect(it) || needsStableVerify(it));
   if (suspects.length === 0) return issues;
 
   const verdicts = new Map();
@@ -2358,7 +2431,14 @@ async function verifyAnimationSuspects(issues, plan, signal, onProgress = () => 
   for (const it of issues) {
     const v = verdicts.get(it.id);
     if (!v) { out.push(it); continue; }          // not a suspect → keep as-is
-    if (!v.real) continue;                        // animation reveal → drop
+    if (!v.real) {
+      // Animation/OCR misreads are high-precision false positives → drop.
+      if (isAnimationSuspect(it) || isOcrSuspect(it)) continue;
+      // A broader spelling/grammar "mistake" the stable frames don't confirm →
+      // never an Actual Mistake; demote to Needs Review so a human can verify.
+      out.push({ ...it, forcedTier: "review", confidence: "low", why: `${it.why ? it.why + " " : ""}(Checked against nearby frames — the stable on-screen text may already be correct; please verify.)` });
+      continue;
+    }
     out.push(v.msg ? { ...it, msg: v.msg, fix: v.fix || it.fix } : it);
   }
   out.forEach((x, i) => { x.id = i + 1; });
