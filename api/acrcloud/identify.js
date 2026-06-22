@@ -30,7 +30,9 @@ export default async function handler(req, res) {
   }
 
   const clean = (v) => (v || "").trim().replace(/^["']|["']$/g, "");
-  const host = clean(process.env.ACRCLOUD_HOST);
+  // Normalize the host: strip any protocol prefix, trailing slash, or accidental
+  // path so `https://${host}/v1/identify` is always a valid URL.
+  const host = clean(process.env.ACRCLOUD_HOST).replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
   const accessKey = clean(process.env.ACRCLOUD_ACCESS_KEY);
   const accessSecret = clean(process.env.ACRCLOUD_ACCESS_SECRET);
 
@@ -55,16 +57,25 @@ export default async function handler(req, res) {
     const stringToSign = ["POST", "/v1/identify", accessKey, "audio", "1", ts].join("\n");
     const signature = crypto.createHmac("sha1", accessSecret).update(Buffer.from(stringToSign, "utf-8")).digest("base64");
 
-    const form = new FormData();
-    form.append("access_key", accessKey);
-    form.append("sample_bytes", String(sample.length));
-    form.append("sample", new Blob([sample], { type: "audio/wav" }), "sample.wav");
-    form.append("data_type", "audio");
-    form.append("signature_version", "1");
-    form.append("timestamp", ts);
-    form.append("signature", signature);
+    // Build multipart/form-data manually (no dependency on global FormData/Blob).
+    const boundary = "----acrqc" + crypto.randomBytes(10).toString("hex");
+    const field = (name, val) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${val}\r\n`, "utf-8");
+    const fileHead = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="sample"; filename="sample.wav"\r\nContent-Type: audio/wav\r\n\r\n`, "utf-8");
+    const body = Buffer.concat([
+      field("access_key", accessKey),
+      field("data_type", "audio"),
+      field("signature_version", "1"),
+      field("signature", signature),
+      field("sample_bytes", String(sample.length)),
+      field("timestamp", ts),
+      fileHead, sample, Buffer.from(`\r\n--${boundary}--\r\n`, "utf-8"),
+    ]);
 
-    const upstream = await fetch(`https://${host}/v1/identify`, { method: "POST", body: form });
+    const upstream = await fetch(`https://${host}/v1/identify`, {
+      method: "POST",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body,
+    });
     const text = await upstream.text();
     res.status(upstream.status);
     res.setHeader("Content-Type", upstream.headers.get("content-type") || "application/json");
