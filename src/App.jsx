@@ -4199,7 +4199,13 @@ function CostCalc() {
             {Object.values(MODES).map((m) => <option key={m.id} value={m.id} style={{ background: "#140e11" }}>{m.label}</option>)}
           </select>
         </div>
-        <div><label style={lbl}>FPS scanned</label><input style={fld} value={fps} onChange={(e) => setFps(e.target.value)} placeholder={String(base.coverageFps)} /></div>
+        <div>
+          <label style={{ ...lbl, display: "flex", alignItems: "center", gap: 6 }}>
+            Frames sampled / sec
+            <InfoDot text="How many still frames per second QC samples for analysis — NOT the video's frame rate. Urgent = 1, Deep = 2. Higher = denser coverage but more cost; total frames are capped at 600. Leave blank to use the mode default." />
+          </label>
+          <input style={fld} value={fps} onChange={(e) => setFps(e.target.value)} placeholder={`${base.coverageFps} (default)`} />
+        </div>
         <div><label style={lbl}>Width px</label><input style={fld} value={w} onChange={(e) => setW(e.target.value)} /></div>
         <div><label style={lbl}>Height px</label><input style={fld} value={h} onChange={(e) => setH(e.target.value)} /></div>
         <div><label style={lbl}>$ / 1M input</label><input style={fld} value={pin} onChange={(e) => setPin(e.target.value)} placeholder={String(base.priceIn)} /></div>
