@@ -944,6 +944,142 @@ async function checkMusicCopyright(file, signal) {
   return { status, configured: true, matches };
 }
 
+// ── Audio level QC (client-side loudness / peak / voice-vs-music) ─────────────
+// Reuses the Web Audio decode pipeline (no API). Measures ITU-R BS.1770 K-weighted
+// loudness (≈ LUFS), sample/true-peak, per-second short-term loudness, and — using
+// the transcript word timestamps — a rough speech-vs-music balance. The raw
+// measurements are returned; findings are derived against an editable platform
+// preset in the UI, so switching YouTube↔Instagram is instant (no re-decode).
+const AUDIO_QC_RATE = 48000;
+const LOUDNESS_PRESETS = {
+  youtube:   { label: "YouTube / Shorts",  lufs: -14, peak: -1 },
+  instagram: { label: "Instagram / Reels", lufs: -15, peak: -1 },
+};
+// BS.1770 K-weighting biquad coefficients @ 48 kHz.
+const KW1 = { b0: 1.53512485958697, b1: -2.69169618940638, b2: 1.19839281085285, a1: -1.69065929318241, a2: 0.73248077421585 };
+const KW2 = { b0: 1.0, b1: -2.0, b2: 1.0, a1: -1.99004745483398, a2: 0.99007225036621 };
+function biquad(x, c) {
+  const y = new Float32Array(x.length);
+  let z1 = 0, z2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const xn = x[i];
+    const yn = c.b0 * xn + z1;
+    z1 = c.b1 * xn - c.a1 * yn + z2;
+    z2 = c.b2 * xn - c.a2 * yn;
+    y[i] = yn;
+  }
+  return y;
+}
+const loudOf = (power) => -0.691 + 10 * Math.log10(power + 1e-12);   // mean-square → LUFS
+
+async function analyzeAudioLevels(file, transcript, signal) {
+  let rendered;
+  try { rendered = await decodeToMono(file, AUDIO_QC_RATE); } catch { return null; }
+  if (!rendered || signal?.aborted) return null;
+  const sr = AUDIO_QC_RATE;
+  const x = rendered.getChannelData(0);
+  if (!x.length) return null;
+
+  // Sample peak + a light 4× linear-oversample for an approximate TRUE peak.
+  let peak = 0, peakIdx = 0;
+  for (let i = 0; i < x.length; i++) { const a = Math.abs(x[i]); if (a > peak) { peak = a; peakIdx = i; } }
+  let tpeak = peak;
+  for (let i = 1; i < x.length; i++) {
+    const a = x[i - 1], b = x[i];
+    for (let k = 1; k < 4; k++) { const v = Math.abs(a + (b - a) * (k / 4)); if (v > tpeak) tpeak = v; }
+  }
+  const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+  const truePeakDb = tpeak > 0 ? 20 * Math.log10(tpeak) : -Infinity;
+
+  // K-weighted signal → gated integrated loudness (400ms blocks, 100ms hop).
+  const y = biquad(biquad(x, KW1), KW2);
+  const blk = Math.round(0.4 * sr), hop = Math.round(0.1 * sr);
+  const powers = [];
+  for (let s = 0; s + blk <= y.length; s += hop) {
+    let sum = 0; for (let i = s; i < s + blk; i++) sum += y[i] * y[i];
+    powers.push(sum / blk);
+  }
+  let integratedLufs = -Infinity;
+  if (powers.length) {
+    let g = powers.filter((p) => loudOf(p) > -70);                 // absolute gate
+    if (g.length) {
+      const m1 = g.reduce((a, b) => a + b, 0) / g.length;
+      const rel = loudOf(m1) - 10;                                  // relative gate
+      const g2 = g.filter((p) => loudOf(p) > rel);
+      const m2 = (g2.length ? g2 : g).reduce((a, b) => a + b, 0) / (g2.length || g.length);
+      integratedLufs = loudOf(m2);
+    }
+  }
+
+  // 1s short-term windows (for the timeline + voice/music split).
+  const wordTimes = (transcript?.words || []).map((w) => w.start);
+  const windows = [];
+  for (let s = 0, t = 0; s < y.length; s += sr, t++) {
+    const end = Math.min(y.length, s + sr);
+    let sum = 0; for (let i = s; i < end; i++) sum += y[i] * y[i];
+    const speech = wordTimes.some((wt) => wt >= t - 0.3 && wt < t + 1.3);
+    windows.push({ t, lufs: Math.max(-60, loudOf(sum / (end - s))), speech });
+  }
+  const med = (arr) => { if (!arr.length) return null; const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const speechL = windows.filter((w) => w.speech && w.lufs > -50).map((w) => w.lufs);
+  const musicL = windows.filter((w) => !w.speech && w.lufs > -50).map((w) => w.lufs);
+
+  return {
+    integratedLufs, peakDb, truePeakDb, peakTime: peakIdx / sr,
+    durationSec: x.length / sr, windows,
+    speechMedian: med(speechL), musicMedian: med(musicL), hasSpeech: speechL.length > 0,
+  };
+}
+
+// Pure: derive user-facing findings + overall status from raw measurements and the
+// selected platform target. Re-run cheaply when the user switches presets.
+function deriveAudioFindings(m, target) {
+  if (!m) return { status: "review", findings: [] };
+  const findings = [];
+  if (isFinite(m.truePeakDb) && m.truePeakDb >= target.peak) {
+    findings.push({ level: "warn", title: "Audio peak warning", at: m.peakTime,
+      msg: "Audio peaks near maximum and may distort after upload.",
+      suggestion: "Lower the master volume or add a limiter.",
+      tech: `True peak ≈ ${m.truePeakDb.toFixed(1)} dBTP (ceiling ${target.peak} dBTP)` });
+  }
+  if (isFinite(m.integratedLufs) && m.integratedLufs > target.lufs + 1.5) {
+    findings.push({ level: "warn", title: "Overall volume above recommended",
+      msg: "The whole video is louder than the recommended upload level.",
+      suggestion: `Lower the master by about ${Math.round(m.integratedLufs - target.lufs)} dB.`,
+      tech: `Integrated ≈ ${m.integratedLufs.toFixed(1)} LUFS (target ${target.lufs} LUFS)` });
+  }
+  // Loudest sustained music-only section (≥2s) clearly above the speaker.
+  if (m.hasSpeech && m.speechMedian != null && m.musicMedian != null && m.musicMedian > m.speechMedian + 1.5) {
+    let best = null, run = null;
+    for (const w of m.windows) {
+      const loudMusic = !w.speech && w.lufs > m.speechMedian + 1.5;
+      if (loudMusic) { if (!run) run = { from: w.t, to: w.t + 1 }; else run.to = w.t + 1; }
+      else { if (run && (!best || run.to - run.from >= best.to - best.from)) best = run; run = null; }
+    }
+    if (run && (!best || run.to - run.from >= best.to - best.from)) best = run;
+    findings.push({ level: "warn", title: "Music louder than voice", from: best?.from, to: best?.to,
+      msg: "Background music is as loud as — or louder than — the speaker in places.",
+      suggestion: "Lower background music by about 3–5 dB under the voice.",
+      tech: `Music ≈ ${m.musicMedian.toFixed(1)} vs voice ≈ ${m.speechMedian.toFixed(1)} LUFS` });
+  } else if (m.hasSpeech && m.speechMedian != null && m.speechMedian < target.lufs - 8) {
+    findings.push({ level: "info", title: "Voice is on the quiet side",
+      msg: "The speaker's voice is quieter than ideal.",
+      suggestion: "Raise the voice track or reduce the music.",
+      tech: `Voice ≈ ${m.speechMedian.toFixed(1)} LUFS` });
+  }
+  let status;
+  if (!isFinite(m.integratedLufs)) status = "review";
+  else if (findings.some((f) => f.level === "warn")) status = "issues";
+  else if (!m.hasSpeech) status = "review";
+  else status = "good";
+  return { status, findings };
+}
+const AUDIO_STATUS = {
+  good:   { label: "Good audio balance", color: "#10b981" },
+  issues: { label: "Audio needs attention", color: "#f59e0b" },
+  review: { label: "Needs manual review", color: "#94a3b8" },
+};
+
 /**
  * Send extracted frames to Claude with the strict QC prompt.
  *
@@ -3465,6 +3601,82 @@ function AddMissedForm({ defaultTs, onAdd, onClose }) {
 }
 
 // Pre-upload music copyright risk — shown in the QC report (ACRCloud pre-check).
+// Audio level QC — loudness / peak / voice-vs-music balance, in plain language.
+function AudioLevelsPanel({ audio, admin }) {
+  const [preset, setPreset] = useState("youtube");
+  const [showTech, setShowTech] = useState(false);
+  if (!audio) return null;
+  const target = LOUDNESS_PRESETS[preset];
+  const { status, findings } = deriveAudioFindings(audio, target);
+  const st = AUDIO_STATUS[status] || AUDIO_STATUS.review;
+  const fmtRange = (f) => f.at != null ? fmtTs(f.at) : (f.from != null ? `${fmtTs(f.from)}–${fmtTs(f.to)}` : "");
+  // Loudness bar: 1s windows, green under target, amber when loud.
+  const maxBars = 80;
+  const wins = audio.windows && audio.windows.length > maxBars
+    ? audio.windows.filter((_, i) => i % Math.ceil(audio.windows.length / maxBars) === 0)
+    : (audio.windows || []);
+  return (
+    <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderLeft: `3px solid ${st.color}`, borderRadius: 14, padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 14 }}>🔊</span>
+        <span style={{ fontSize: 13, fontWeight: 800 }}>Audio Levels</span>
+        <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 800, letterSpacing: "0.04em", textTransform: "uppercase", padding: "3px 10px", borderRadius: 20, color: st.color, background: `${st.color}1a`, border: `1px solid ${st.color}55` }}>
+          {st.label}
+        </span>
+      </div>
+
+      {/* Loudness mini-timeline */}
+      {wins.length > 0 && (
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 1.5, height: 36, margin: "6px 0 10px", padding: "0 1px" }}>
+          {wins.map((w, i) => {
+            const h = Math.max(2, Math.min(36, ((w.lufs + 50) / 50) * 36));
+            const loud = w.lufs > target.lufs + 1.5;
+            return <div key={i} title={`${fmtTs(w.t)} · ${w.lufs.toFixed(0)} LUFS`} style={{ flex: 1, height: h, borderRadius: 1, background: loud ? "#f59e0b" : (w.speech ? "#34d399" : "rgba(255,255,255,0.22)") }} />;
+          })}
+        </div>
+      )}
+
+      {findings.length === 0 ? (
+        <p style={{ fontSize: 12, color: T.textMute, lineHeight: 1.5, margin: 0 }}>
+          {status === "good" ? "Levels look balanced for upload — voice sits above the music and nothing peaks too hard." : "Couldn't confidently assess the balance — give it a quick manual listen."}
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {findings.map((f, i) => (
+            <div key={i} style={{ padding: "8px 10px", borderRadius: 9, background: "rgba(255,255,255,0.03)", border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: f.level === "warn" ? "#fcd34d" : T.textMute }}>
+                {f.title}{fmtRange(f) ? <span style={{ color: T.textDim, fontWeight: 500 }}> · {fmtRange(f)}</span> : null}
+              </div>
+              <div style={{ fontSize: 11.5, color: "rgba(255,255,255,0.82)", lineHeight: 1.5, marginTop: 2 }}>{f.msg}</div>
+              <div style={{ fontSize: 11.5, color: T.redLight, lineHeight: 1.5, marginTop: 1 }}>{f.suggestion}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, paddingTop: 8, borderTop: `1px solid ${T.border}`, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 10.5, color: T.textDim }}>Target:</span>
+        {Object.entries(LOUDNESS_PRESETS).map(([k, v]) => (
+          <button key={k} onClick={() => setPreset(k)} style={{ fontSize: 10.5, fontWeight: 700, padding: "3px 9px", borderRadius: 7, cursor: "pointer", color: preset === k ? "white" : T.textMute, background: preset === k ? T.redTint : "rgba(255,255,255,0.04)", border: `1px solid ${preset === k ? T.borderHot : T.border}` }}>{v.label}</button>
+        ))}
+        {admin && (
+          <button onClick={() => setShowTech((v) => !v)} style={{ marginLeft: "auto", fontSize: 10.5, color: T.textDim, cursor: "pointer", background: "none", fontWeight: 600 }}>
+            {showTech ? "▾" : "▸"} technical
+          </button>
+        )}
+      </div>
+      {admin && showTech && (
+        <p style={{ fontSize: 10.5, color: T.textDim, fontFamily: "DM Mono, monospace", lineHeight: 1.6, marginTop: 6 }}>
+          Integrated: {isFinite(audio.integratedLufs) ? audio.integratedLufs.toFixed(1) : "—"} LUFS · True peak: {isFinite(audio.truePeakDb) ? audio.truePeakDb.toFixed(1) : "—"} dBTP · Voice med: {audio.speechMedian != null ? audio.speechMedian.toFixed(1) : "—"} · Music med: {audio.musicMedian != null ? audio.musicMedian.toFixed(1) : "—"} LUFS · target {target.lufs} LUFS / {target.peak} dBTP
+        </p>
+      )}
+      <p style={{ fontSize: 10, color: T.textDim, lineHeight: 1.5, marginTop: 8 }}>
+        Approximate loudness analysis to guide your mix — give the final cut a listen before publishing.
+      </p>
+    </div>
+  );
+}
+
 function MusicRiskPanel({ music }) {
   if (!music) return null;
   if (music.configured === false) {
@@ -3524,7 +3736,7 @@ function ResultsStage(props) {
     currentTs, setCurrentTs, selectedIssue, seekToIssue, navigateIssue,
     mistakeCount, reviewCount, styleCount, doneCount,
     overallScore, onNewUpload, onExport, onRecheck, doneIds, toggleDone, briefWasUsed,
-    memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback, musicRisk,
+    memory, onLearnCorrect, onAddMissed, onUnlearn, onFeedback, musicRisk, audioLevels, admin,
   } = props;
   const [showMemory, setShowMemory] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -3611,6 +3823,8 @@ function ResultsStage(props) {
               </div>
             </div>
           </div>
+
+          <AudioLevelsPanel audio={audioLevels} admin={admin} />
 
           <MusicRiskPanel music={musicRisk} />
 
@@ -3948,6 +4162,79 @@ function AdminFilterChip({ label, count, active, onClick, color }) {
   );
 }
 
+// Admin-only internal cost calculator. All fields editable; auto-estimates with
+// the app's own estimateScanCost() formula. Not shown to normal users.
+function CostCalc() {
+  const [mins, setMins] = useState("1");
+  const [modeId, setModeId] = useState("urgent");
+  const [fps, setFps] = useState("");
+  const [w, setW] = useState("1080");
+  const [h, setH] = useState("1920");
+  const [pin, setPin] = useState("");
+  const [pout, setPout] = useState("");
+  const num = (v, d) => (v !== "" && isFinite(Number(v)) ? Number(v) : d);
+  const base = MODES[modeId];
+  const mode = { ...base, coverageFps: num(fps, base.coverageFps), priceIn: num(pin, base.priceIn), priceOut: num(pout, base.priceOut) };
+  const W = num(w, 1080), H = num(h, 1920);
+  const est = estimateScanCost(num(mins, 1) * 60, W, H, mode);
+  const perMin = num(mins, 1) > 0 ? est.cost / num(mins, 1) : est.cost;
+  const scenarios = [
+    { label: "1-min reel · Urgent", m: MODES.urgent, sec: 60 },
+    { label: "1-min reel · Deep", m: MODES.deep, sec: 60 },
+    { label: "5-min video · Urgent", m: MODES.urgent, sec: 300 },
+    { label: "5-min video · Deep", m: MODES.deep, sec: 300 },
+  ].map((s) => ({ ...s, est: estimateScanCost(s.sec, W, H, s.m) }));
+  const fld = { width: "100%", padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.05)", border: `1px solid ${T.border}`, color: "white", fontSize: 12.5, outline: "none", fontFamily: "DM Mono, monospace" };
+  const lbl = { fontSize: 10.5, color: T.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 5 };
+  const cell = { padding: "10px 12px", borderBottom: `1px solid ${T.border}`, fontSize: 12.5 };
+  return (
+    <div style={{ padding: 18 }}>
+      <p style={{ fontSize: 11.5, color: T.textDim, marginBottom: 16 }}>
+        Internal cost estimate (admin only). All fields are editable — update model pricing as it changes. Uses the same formula as the live scan estimate.
+      </p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 18 }}>
+        <div><label style={lbl}>Video length (min)</label><input style={fld} value={mins} onChange={(e) => setMins(e.target.value)} /></div>
+        <div><label style={lbl}>Scan mode</label>
+          <select style={fld} value={modeId} onChange={(e) => setModeId(e.target.value)}>
+            {Object.values(MODES).map((m) => <option key={m.id} value={m.id} style={{ background: "#140e11" }}>{m.label}</option>)}
+          </select>
+        </div>
+        <div><label style={lbl}>FPS scanned</label><input style={fld} value={fps} onChange={(e) => setFps(e.target.value)} placeholder={String(base.coverageFps)} /></div>
+        <div><label style={lbl}>Width px</label><input style={fld} value={w} onChange={(e) => setW(e.target.value)} /></div>
+        <div><label style={lbl}>Height px</label><input style={fld} value={h} onChange={(e) => setH(e.target.value)} /></div>
+        <div><label style={lbl}>$ / 1M input</label><input style={fld} value={pin} onChange={(e) => setPin(e.target.value)} placeholder={String(base.priceIn)} /></div>
+        <div><label style={lbl}>$ / 1M output</label><input style={fld} value={pout} onChange={(e) => setPout(e.target.value)} placeholder={String(base.priceOut)} /></div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: 20 }}>
+        {[["Frames", est.frames], ["API calls", est.calls], ["Input tokens", `~${(est.inputTokens / 1000).toFixed(0)}K`], ["Est. cost", `$${est.cost.toFixed(3)}`], ["Per minute", `$${perMin.toFixed(3)}`]].map(([k, v], i) => (
+          <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${T.border}`, borderRadius: 10, padding: "12px 14px" }}>
+            <div style={{ fontSize: 20, fontWeight: 800, color: k === "Est. cost" || k === "Per minute" ? "#34d399" : "white", fontFamily: "DM Mono, monospace" }}>{v}</div>
+            <div style={{ fontSize: 10.5, color: T.textDim, marginTop: 2 }}>{k}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 10.5, color: T.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Quick scenarios (at {W}×{H})</div>
+      <div style={{ overflowX: "auto", border: `1px solid ${T.border}`, borderRadius: 10 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 460 }}>
+          <thead><tr>{["Scenario", "Frames", "Calls", "Cost"].map((x, i) => <th key={i} style={{ ...cell, textAlign: i === 0 ? "left" : "right", color: T.textDim, fontSize: 10.5, textTransform: "uppercase", fontWeight: 700 }}>{x}</th>)}</tr></thead>
+          <tbody>
+            {scenarios.map((s, i) => (
+              <tr key={i}>
+                <td style={{ ...cell, fontWeight: 600 }}>{s.label}</td>
+                <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>{s.est.frames}</td>
+                <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>{s.est.calls}</td>
+                <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", fontWeight: 800, color: "#34d399" }}>${s.est.cost.toFixed(3)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback }) {
   const [tab, setTab] = useState("overview");   // overview | videos | feedback
   const scans = allScans || [];
@@ -3997,9 +4284,14 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
         <AdminFilterChip label="👥 Users" count={users.length} active={tab === "overview"} onClick={() => setTab("overview")} color="#ef4444" />
         <AdminFilterChip label="🎬 Videos" count={scans.length} active={tab === "videos"} onClick={() => setTab("videos")} color="#ef4444" />
         <AdminFilterChip label="🧠 Feedback" count={fb.length} active={tab === "feedback"} onClick={() => setTab("feedback")} color="#ef4444" />
+        <AdminFilterChip label="💰 Cost" active={tab === "cost"} onClick={() => setTab("cost")} color="#ef4444" />
       </div>
 
-      {loading ? (
+      {tab === "cost" ? (
+        <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+          <CostCalc />
+        </div>
+      ) : loading ? (
         <p style={{ color: T.textDim }}>Loading all reports on this device…</p>
       ) : scans.length === 0 && fb.length === 0 ? (
         <div style={{ textAlign: "center", padding: "60px 20px", border: `1px dashed ${T.border}`, borderRadius: 16 }}>
@@ -4201,11 +4493,13 @@ export default function App() {
   const [feedback, setFeedback] = useState(loadFeedback);  // ADMIN: QC-feedback log
   const [showScanDone, setShowScanDone] = useState(false); // post-scan reminder modal
   const [musicRisk, setMusicRisk] = useState(null);        // pre-upload music copyright check
+  const [audioLevels, setAudioLevels] = useState(null);    // audio loudness / peak / balance QC
   const admin = isAdmin(user);
 
   const fileRef = useRef(null);
   const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
   const musicRiskRef = useRef(null);                       // latest music-check result (for persistScan)
+  const audioLevelsRef = useRef(null);                     // latest audio-levels result (for persistScan)
   const reviewCtxRef = useRef(null);                       // {scanId, owner, fileName} of the report being reviewed
   const wantPlayRef = useRef(false);                       // play from the pre-roll point after an issue click
   const videoRef = useRef(null);
@@ -4268,6 +4562,7 @@ export default function App() {
     setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
     setScanDeadline(null); checkpointRef.current = null; currentScanIdRef.current = null;
     setShowScanDone(false); setMusicRisk(null); musicRiskRef.current = null;
+    setAudioLevels(null); audioLevelsRef.current = null;
     setStage("dashboard");
     if (user) refreshScans(user);
   }, [user, refreshScans]);
@@ -4303,7 +4598,7 @@ export default function App() {
       sizeMb: +((f.size || 0) / 1048576).toFixed(1),
       durationSec: duration, createdAt: Date.now(),
       issues: issuesList, score, errors, warnings, info,
-      briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, blob: f,
+      briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, audioLevels: audioLevelsRef.current, blob: f,
     });
     refreshScans(user);
   }, [user, briefWasUsed, refreshScans]);
@@ -4322,6 +4617,7 @@ export default function App() {
     setVideoDuration(rec.durationSec || 60);
     setBriefWasUsed(!!rec.briefUsed);
     setMusicRisk(rec.musicRisk || null); musicRiskRef.current = rec.musicRisk || null;
+    setAudioLevels(rec.audioLevels || null); audioLevelsRef.current = rec.audioLevels || null;
     setDoneIds(new Set(rec.doneIds || []));
     setSelectedIssue(null); setCurrentTs(null);
     setActiveTab("qc_technical"); setActiveFilter("mistake");
@@ -4395,6 +4691,7 @@ export default function App() {
     setCanResume(false);
     setDoneIds(new Set());
     setMusicRisk(null); musicRiskRef.current = null;
+    setAudioLevels(null); audioLevelsRef.current = null;
     setBriefWasUsed(briefForThisRun.length > 0);
 
     try {
@@ -4412,6 +4709,11 @@ export default function App() {
       const { frames, duration } = framesResult;
       setVideoDuration(duration);
       if (controller.signal.aborted) return;
+
+      // Audio-level QC needs the transcript (for the voice/music split). Kick it
+      // off now and let it run alongside the frame analysis; await before finalize.
+      const audioPromise = analyzeAudioLevels(f, transcript, controller.signal)
+        .catch((e) => { console.warn("[BB QC] audio-levels skipped:", e.message); return null; });
 
       // DIVIDE: cut the timeline into chronological segments (1s overlap). The
       // `plan` IS the resumable checkpoint, kept in memory (no DB).
@@ -4455,6 +4757,8 @@ export default function App() {
       const finalIssues = await verifyAnimationSuspects(result.issues, plan, controller.signal, (p) => setAnalysisProgress(p));
       if (controller.signal.aborted) return;
       setIssues(sortByTs(finalIssues));
+      const audio = await audioPromise;                 // audio-level QC (started above)
+      audioLevelsRef.current = audio; setAudioLevels(audio);
       finishRun(result);
       // Save (or update, on resume) this report to the user's workspace history.
       persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
@@ -4773,6 +5077,8 @@ export default function App() {
             onUnlearn={unlearn}
             onFeedback={admin ? recordFeedback : null}
             musicRisk={musicRisk}
+            audioLevels={audioLevels}
+            admin={admin}
           />
         )}
         {stage === "admin" && admin && (
