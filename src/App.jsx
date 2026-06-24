@@ -3601,6 +3601,50 @@ function AddMissedForm({ defaultTs, onAdd, onClose }) {
 }
 
 // Pre-upload music copyright risk — shown in the QC report (ACRCloud pre-check).
+// Collapsible wrapper so Audio + Copyright checks don't push the Issue Timeline
+// down. Default collapsed → just a one-row bar with status pills; expands to the
+// full Audio Levels + Copyright/Music Risk cards.
+function AudioCopyrightSection({ audio, music, admin }) {
+  const [open, setOpen] = useState(false);
+  if (!audio && !music) return null;
+
+  const aStatus = audio ? deriveAudioFindings(audio, LOUDNESS_PRESETS.youtube).status : null;
+  const audioPill = audio
+    ? { label: ({ good: "Good", issues: "Check", review: "Review" })[aStatus] || "—", color: (AUDIO_STATUS[aStatus] || AUDIO_STATUS.review).color }
+    : null;
+  const musicPill = !music ? null
+    : music.configured === false ? { label: "Off", color: T.textDim }
+    : { label: ({ clear: "No match", unknown_license: "Detected", possible: "Possible", high: "High risk", unverified: "—" })[music.status] || "—", color: (MUSIC_STATUS[music.status] || MUSIC_STATUS.unverified).color };
+
+  const pill = (icon, label, color) => (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20, color, background: `${color}1a`, border: `1px solid ${color}55` }}>
+      <span style={{ fontSize: 11 }}>{icon}</span>{label}
+    </span>
+  );
+
+  return (
+    <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16 }}>
+      <button onClick={() => setOpen((v) => !v)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "13px 16px", cursor: "pointer", background: "none", textAlign: "left" }}>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Audio &amp; Copyright</span>
+        <span style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", marginLeft: 6 }}>
+          {audioPill && pill("🔊", `Audio: ${audioPill.label}`, audioPill.color)}
+          {musicPill && pill("🎵", `Music: ${musicPill.label}`, musicPill.color)}
+        </span>
+        <span style={{ marginLeft: "auto", color: T.textDim, fontSize: 12, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 }}>
+          {open ? "Hide" : "Details"}
+          <span style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s", display: "inline-block" }}>▸</span>
+        </span>
+      </button>
+      {open && (
+        <div style={{ borderTop: `1px solid ${T.border}`, padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+          <AudioLevelsPanel audio={audio} admin={admin} />
+          <MusicRiskPanel music={music} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Audio level QC — loudness / peak / voice-vs-music balance, in plain language.
 function AudioLevelsPanel({ audio, admin }) {
   const [preset, setPreset] = useState("youtube");
@@ -3824,9 +3868,7 @@ function ResultsStage(props) {
             </div>
           </div>
 
-          <AudioLevelsPanel audio={audioLevels} admin={admin} />
-
-          <MusicRiskPanel music={musicRisk} />
+          <AudioCopyrightSection audio={audioLevels} music={musicRisk} admin={admin} />
 
           <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 16, padding: 18 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
