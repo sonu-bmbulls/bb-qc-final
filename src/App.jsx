@@ -665,24 +665,72 @@ function exportReportPDF({ fileName, issues, doneIds, durationSec, score }) {
 }
 
 // List a user's scans (newest first) and purge anything past the 7-day window.
+// Phase-1 internal beta: NO auto-delete — reports stay until admin removes them.
+// Normal views hide soft-deleted records; admin can include them.
 async function listUserScans(user) {
   let all = [];
   try { all = await idbGetAll(); } catch { return []; }
-  const cutoff = Date.now() - SCAN_RETENTION_MS;
-  for (const r of all) if (r.createdAt < cutoff) { try { await idbDelete(r.id); } catch { /* */ } }
   const key = normalizeUser(user);
   return all
-    .filter((r) => r.createdAt >= cutoff && normalizeUser(r.user) === key)
+    .filter((r) => !r.deleted && normalizeUser(r.user) === key)
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
-// ADMIN: every scan in THIS browser (all users), newest first. Purges expired.
+// ADMIN: every scan in THIS browser (all users), newest first. Includes
+// soft-deleted records (the admin UI filters them) so they can be restored.
 async function listAllScans() {
   let all = [];
   try { all = await idbGetAll(); } catch { return []; }
-  const cutoff = Date.now() - SCAN_RETENTION_MS;
-  for (const r of all) if (r.createdAt < cutoff) { try { await idbDelete(r.id); } catch { /* */ } }
-  return all.filter((r) => r.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt);
+  return all.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// Soft delete (Phase-1): mark deleted but keep the record (incl. cost/usage) for
+// analytics. Admin can restore, or hard-delete to reclaim storage.
+async function softDeleteScan(id) {
+  try { const rec = await idbGet(id); if (rec) await saveScan({ ...rec, deleted: true, updatedAt: Date.now() }); } catch { /* ignore */ }
+}
+async function restoreScan(id) {
+  try { const rec = await idbGet(id); if (rec) await saveScan({ ...rec, deleted: false, updatedAt: Date.now() }); } catch { /* ignore */ }
+}
+const hardDeleteScan = (id) => idbDelete(id);
+
+// ── Usage caps (Phase-1 safety, admin-editable; 0 = no limit) ─────────────────
+const CAPS_KEY = "bbqc_caps";
+const DEFAULT_CAPS = { maxScansPerDay: 50, maxVideosPerDay: 0, maxDurationSec: 600, maxFileMb: 500, maxCostPerScan: 0 };
+function loadCaps() { try { return { ...DEFAULT_CAPS, ...(JSON.parse(localStorage.getItem(CAPS_KEY) || "{}") || {}) }; } catch { return { ...DEFAULT_CAPS }; } }
+function saveCaps(c) { try { localStorage.setItem(CAPS_KEY, JSON.stringify({ ...DEFAULT_CAPS, ...c })); } catch { /* ignore */ } }
+function startOfToday() { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }
+function scansToday(user) {
+  const t0 = startOfToday(), key = normalizeUser(user);
+  return loadUsageLedger().filter((e) => e.ts >= t0 && normalizeUser(e.user) === key && !/\(resume\)\s*$/.test(e.fileName || "")).length;
+}
+function videosToday(user) {
+  const t0 = startOfToday(), key = normalizeUser(user);
+  const names = new Set(loadUsageLedger().filter((e) => e.ts >= t0 && normalizeUser(e.user) === key).map((e) => (e.fileName || "").replace(/\s*\(resume\)\s*$/, "")));
+  return names.size;
+}
+// Returns a clean blocking message if a cap is hit (before any API spend), else null.
+// `phase` "pre" runs before scanning (file size + daily counts); "duration" after we know length.
+function capBlock({ user, fileSizeMb, durationSec, mode, phase }) {
+  if (isAdmin(user)) return null;   // admin is exempt during internal beta
+  const c = loadCaps();
+  if (phase === "duration") {
+    if (c.maxDurationSec > 0 && durationSec > c.maxDurationSec)
+      return `This video is too long for the current internal beta limit (${fmtTs(c.maxDurationSec)} max). Please trim it or contact admin.`;
+    if (c.maxCostPerScan > 0 && mode) {
+      const est = estimateScanCost(durationSec, 1080, 1920, mode);
+      if (est.cost > c.maxCostPerScan)
+        return `This scan's estimated cost ($${est.cost.toFixed(2)}) exceeds the internal beta cap ($${c.maxCostPerScan.toFixed(2)}). Try Urgent mode or a shorter clip, or contact admin.`;
+    }
+    return null;
+  }
+  if (c.maxFileMb > 0 && fileSizeMb > c.maxFileMb)
+    return `This file is too large for the internal beta limit (${c.maxFileMb} MB max). Please compress it or contact admin.`;
+  if (c.maxScansPerDay > 0 && scansToday(user) >= c.maxScansPerDay)
+    return `Daily scan limit reached (${c.maxScansPerDay}/day). Please contact admin.`;
+  if (c.maxVideosPerDay > 0 && videosToday(user) >= c.maxVideosPerDay)
+    return `Daily video limit reached (${c.maxVideosPerDay}/day). Please contact admin.`;
+  return null;
 }
 
 // Pending Mistake / Review / Style counts for a saved report (excludes items the
@@ -4167,7 +4215,7 @@ function ScanCard({ rec, onOpen }) {
         <span style={{ fontSize: 11, color: T.redLight, fontWeight: 700 }}>{rec.errors} err</span>
         <span style={{ fontSize: 11, color: "#fcd34d", fontWeight: 700 }}>{rec.warnings} warn</span>
         <StatusPill errors={rec.errors} />
-        <span style={{ marginLeft: "auto", fontSize: 10, color: T.textDim }}>⏳ {daysLeft(rec.createdAt)}d left</span>
+        {typeof rec.costUsd === "number" && <span style={{ marginLeft: "auto", fontSize: 10, color: T.textDim, fontFamily: "DM Mono, monospace" }}>${rec.costUsd.toFixed(3)}</span>}
       </div>
     </div>
   );
@@ -4180,7 +4228,7 @@ function DashboardStage({ user, scans, loading, onNewScan, onOpen, onDelete }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: 28 }}>
         <div>
           <h1 style={{ fontSize: 28, fontWeight: 800, letterSpacing: "-0.02em" }}>Your QC Workspace</h1>
-          <p style={{ color: T.textDim, fontSize: 14, marginTop: 4 }}>Signed in as <strong style={{ color: "white" }}>{user}</strong> · reports kept for 7 days</p>
+          <p style={{ color: T.textDim, fontSize: 14, marginTop: 4 }}>Signed in as <strong style={{ color: "white" }}>{user}</strong> · reports saved to your workspace</p>
         </div>
         <button onClick={onNewScan} style={{ padding: "13px 24px", borderRadius: 12, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 14, fontWeight: 800, boxShadow: "0 4px 14px rgba(220,38,38,0.35)" }}>＋ New QC Scan</button>
       </div>
@@ -4252,6 +4300,40 @@ function AdminFilterChip({ label, count, active, onClick, color }) {
       border: `1px solid ${active ? color + "88" : T.border}` }}>
       {label}{count != null ? ` ${count}` : ""}
     </button>
+  );
+}
+
+// Admin-editable usage caps (Phase-1 safety). 0 = no limit. Saved to localStorage.
+function CapsEditor() {
+  const [caps, setCaps] = useState(loadCaps);
+  const [saved, setSaved] = useState(false);
+  const set = (k, v) => { setCaps((c) => ({ ...c, [k]: v })); setSaved(false); };
+  const save = () => {
+    const clean = Object.fromEntries(Object.entries(caps).map(([k, v]) => [k, Math.max(0, Number(v) || 0)]));
+    saveCaps(clean); setCaps(clean); setSaved(true);
+  };
+  const fields = [
+    ["maxScansPerDay", "Max scans / user / day"],
+    ["maxVideosPerDay", "Max videos / user / day"],
+    ["maxDurationSec", "Max video length (sec)"],
+    ["maxFileMb", "Max file size (MB)"],
+    ["maxCostPerScan", "Max cost / scan ($)"],
+  ];
+  const fld = { width: "100%", padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.05)", border: `1px solid ${T.border}`, color: "white", fontSize: 12.5, outline: "none", fontFamily: "DM Mono, monospace" };
+  const lbl = { fontSize: 10, color: T.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", display: "block", marginBottom: 5 };
+  return (
+    <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${T.border}` }}>
+      <div style={{ fontSize: 12, fontWeight: 800, marginBottom: 4 }}>🛡 Usage caps</div>
+      <p style={{ fontSize: 10.5, color: T.textDim, marginBottom: 10 }}>Safety limits for internal beta. <strong>0 = no limit.</strong> Admin (you) is exempt. Users see a clean message when a cap is hit.</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+        {fields.map(([k, label]) => (
+          <div key={k}><label style={lbl}>{label}</label><input style={fld} value={caps[k]} onChange={(e) => set(k, e.target.value)} /></div>
+        ))}
+      </div>
+      <button onClick={save} style={{ marginTop: 12, padding: "8px 16px", borderRadius: 9, cursor: "pointer", border: "none", background: saved ? "rgba(16,185,129,0.15)" : T.gradient, color: saved ? "#34d399" : "white", fontSize: 12, fontWeight: 800 }}>
+        {saved ? "✓ Saved" : "Save caps"}
+      </button>
+    </div>
   );
 }
 
@@ -4331,13 +4413,36 @@ function UsageDashboard({ ledger, onClear }) {
         {card(`${(totalOut / 1000).toFixed(0)}K`, "Output tokens")}
       </div>
 
+      {/* Per-user spending detail */}
+      <div style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 10.5, color: T.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Per-user spending</div>
+        <div style={{ border: `1px solid ${T.border}`, borderRadius: 10, overflow: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
+            <thead><tr>{["User", "Scans", "Duration", "Total $", "$/scan", "$/min"].map((h, i) => <th key={i} style={{ ...cell, textAlign: i === 0 ? "left" : "right", color: T.textDim, fontSize: 10, textTransform: "uppercase", fontWeight: 700 }}>{h}</th>)}</tr></thead>
+            <tbody>
+              {byUser.length === 0 ? <tr><td style={{ ...cell, color: T.textDim }}>No data yet</td></tr> : byUser.map(([u, g], i) => (
+                <tr key={i}>
+                  <td style={{ ...cell, fontWeight: 600 }}>{u}</td>
+                  <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>{g.count}</td>
+                  <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>{fmtTs(g.dur)}</td>
+                  <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", fontWeight: 800, color: "#34d399" }}>${g.cost.toFixed(3)}</td>
+                  <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>${(g.count ? g.cost / g.count : 0).toFixed(3)}</td>
+                  <td style={{ ...cell, textAlign: "right", fontFamily: "DM Mono, monospace", color: T.textMute }}>${(g.dur ? g.cost / (g.dur / 60) : 0).toFixed(3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       {miniTable("By scan mode", byMode)}
-      {miniTable("By user", byUser)}
       {miniTable("By day", byDay)}
 
       {rows.length > 0 && (
         <button onClick={onClear} style={{ marginTop: 14, padding: "7px 13px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11, fontWeight: 700, border: `1px solid ${T.border}` }}>Clear usage ledger</button>
       )}
+
+      <CapsEditor />
     </div>
   );
 }
@@ -4421,7 +4526,8 @@ function CostCalc() {
   );
 }
 
-function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback, usage, onClearUsage }) {
+function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback, usage, onClearUsage, onSoftDelete, onRestore, onHardDelete }) {
+  const [showDeleted, setShowDeleted] = useState(false);
   const [tab, setTab] = useState("overview");   // overview | videos | feedback
   const scans = allScans || [];
   const fb = feedback || [];
@@ -4521,30 +4627,45 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
             )}
 
             {tab === "videos" && (
-              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 820 }}>
-                <thead><tr>
-                  {["Video", "User", "Uploaded", "Score", "Mistake", "Review", "Style", ""].map((h, i) => <th key={i} style={{ ...th, textAlign: i >= 3 && i <= 6 ? "center" : "left" }}>{h}</th>)}
-                </tr></thead>
-                <tbody>
-                  {scans.map((r) => {
-                    const c = scanTierCounts(r);
-                    return (
-                      <tr key={r.id}>
-                        <td style={{ ...td, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>🎬 {r.fileName}</td>
-                        <td style={{ ...td, color: T.textMute, fontWeight: 700 }}>{r.user || "—"}</td>
-                        <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtDate(r.createdAt)} {fmtClock(r.createdAt)}</td>
-                        <td style={{ ...td, textAlign: "center", fontWeight: 800, fontFamily: "DM Mono, monospace", color: r.score >= 80 ? "#10b981" : r.score >= 60 ? "#f59e0b" : T.redBright }}>{r.score}</td>
-                        <td style={{ ...td, textAlign: "center", color: T.redLight, fontWeight: 700 }}>{c.mistake}</td>
-                        <td style={{ ...td, textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{c.review}</td>
-                        <td style={{ ...td, textAlign: "center", color: T.textMute }}>{c.style}</td>
-                        <td style={{ ...td, textAlign: "center", whiteSpace: "nowrap" }}>
-                          <button onClick={() => onOpen(r.id)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 11, fontWeight: 700 }}>Open & review</button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderBottom: `1px solid ${T.border}` }}>
+                  <span style={{ fontSize: 11, color: T.textDim }}>{scans.filter((r) => !r.deleted).length} active · {scans.filter((r) => r.deleted).length} deleted</span>
+                  <label style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, color: T.textMute, cursor: "pointer" }}>
+                    <input type="checkbox" checked={showDeleted} onChange={(e) => setShowDeleted(e.target.checked)} /> Show deleted
+                  </label>
+                </div>
+                <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 860 }}>
+                  <thead><tr>
+                    {["Video", "User", "Uploaded", "Score", "Cost", "M", "R", "S", ""].map((h, i) => <th key={i} style={{ ...th, textAlign: i >= 3 && i <= 7 ? "center" : "left" }}>{h}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {scans.filter((r) => showDeleted || !r.deleted).map((r) => {
+                      const c = scanTierCounts(r);
+                      return (
+                        <tr key={r.id} style={{ opacity: r.deleted ? 0.5 : 1 }}>
+                          <td style={{ ...td, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>{r.deleted ? "🗑 " : "🎬 "}{r.fileName}</td>
+                          <td style={{ ...td, color: T.textMute, fontWeight: 700 }}>{r.user || "—"}</td>
+                          <td style={{ ...td, color: T.textMute, fontFamily: "DM Mono, monospace", whiteSpace: "nowrap" }}>{fmtDate(r.createdAt)} {fmtClock(r.createdAt)}</td>
+                          <td style={{ ...td, textAlign: "center", fontWeight: 800, fontFamily: "DM Mono, monospace", color: r.score >= 80 ? "#10b981" : r.score >= 60 ? "#f59e0b" : T.redBright }}>{r.score}</td>
+                          <td style={{ ...td, textAlign: "center", fontFamily: "DM Mono, monospace", color: "#34d399" }}>{typeof r.costUsd === "number" ? `$${r.costUsd.toFixed(3)}` : "—"}</td>
+                          <td style={{ ...td, textAlign: "center", color: T.redLight, fontWeight: 700 }}>{c.mistake}</td>
+                          <td style={{ ...td, textAlign: "center", color: "#fcd34d", fontWeight: 700 }}>{c.review}</td>
+                          <td style={{ ...td, textAlign: "center", color: T.textMute }}>{c.style}</td>
+                          <td style={{ ...td, textAlign: "right", whiteSpace: "nowrap" }}>
+                            <button onClick={() => onOpen(r.id)} style={{ padding: "5px 11px", borderRadius: 8, border: "none", cursor: "pointer", background: T.gradient, color: "white", fontSize: 10.5, fontWeight: 700 }}>Open</button>
+                            {r.deleted
+                              ? <>
+                                  <button onClick={() => onRestore(r.id)} title="Restore" style={{ marginLeft: 5, padding: "5px 9px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.05)", color: "#34d399", fontSize: 10.5, fontWeight: 700, border: `1px solid ${T.border}` }}>↩</button>
+                                  <button onClick={() => { if (window.confirm("Permanently delete this video + report? This cannot be undone.")) onHardDelete(r.id); }} title="Delete permanently" style={{ marginLeft: 5, padding: "5px 9px", borderRadius: 8, cursor: "pointer", background: "rgba(239,68,68,0.1)", color: T.redLight, fontSize: 10.5, fontWeight: 700, border: `1px solid ${T.borderHot}` }}>✕</button>
+                                </>
+                              : <button onClick={() => onSoftDelete(r.id)} title="Delete (soft — kept for analytics)" style={{ marginLeft: 5, padding: "5px 9px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.05)", color: T.textDim, fontSize: 10.5, fontWeight: 700, border: `1px solid ${T.border}` }}>🗑</button>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
             )}
 
             {tab === "feedback" && (
@@ -4786,10 +4907,15 @@ export default function App() {
     const score = Math.max(0, 100 - errors * 12 - warnings * 4);
     const id = reuseId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     currentScanIdRef.current = id;
+    // ── Scan record schema (Phase-1 "database" row in IndexedDB) ──────────────
+    //   id, user, role, fileName, sizeMb, durationSec, modeId, createdAt, updatedAt,
+    //   deleted, score, errors/warnings/info, issues[] (with timestamps/tier/fix),
+    //   briefUsed, musicRisk, audioLevels, usage {in/out/cache/calls}, costUsd, blob.
     await saveScan({
-      id, user, fileName: f.name || "video.mp4",
+      id, user, role: isAdmin(user) ? "admin" : "user",
+      fileName: f.name || "video.mp4",
       sizeMb: +((f.size || 0) / 1048576).toFixed(1),
-      durationSec: duration, createdAt: Date.now(),
+      durationSec: duration, createdAt: Date.now(), updatedAt: Date.now(), deleted: false,
       issues: issuesList, score, errors, warnings, info,
       briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, audioLevels: audioLevelsRef.current,
       modeId: scanMetaRef.current?.modeId, usage: scanMetaRef.current?.usage, costUsd: scanMetaRef.current?.costUsd, blob: f,
@@ -4822,10 +4948,16 @@ export default function App() {
     setStage("results");
   }, [user]);
 
+  // Normal delete = SOFT delete (kept for analytics, hidden from dashboards).
   const deleteScan = useCallback(async (id) => {
-    try { await idbDelete(id); } catch { /* ignore */ }
+    await softDeleteScan(id);
     if (user) refreshScans(user);
   }, [user, refreshScans]);
+
+  // Admin storage controls (from the Videos tab).
+  const adminRestoreScan = useCallback(async (id) => { await restoreScan(id); setAllScans(await listAllScans()); }, []);
+  const adminSoftDelete = useCallback(async (id) => { await softDeleteScan(id); setAllScans(await listAllScans()); }, []);
+  const adminHardDelete = useCallback(async (id) => { await hardDeleteScan(id); setAllScans(await listAllScans()); }, []);
 
   // ── Admin: open the panel (loads every scan on this device + the feedback log)
   const openAdmin = useCallback(async () => {
@@ -4877,6 +5009,9 @@ export default function App() {
     const memoryForThisRun = loadMemory(user);   // freshest learned corrections for this user
     const cfg = MODES[mode];
     setFile(f);
+    // Usage caps (Phase-1 safety) — file size + daily counts, before any API spend.
+    const preBlock = capBlock({ user, fileSizeMb: (f?.size || 0) / 1048576, phase: "pre" });
+    if (preBlock) { setAnalysisError(preBlock); setStage("analyzing"); return; }
     setStage("analyzing");
     setIssues([]);
     setSelectedIssue(null);
@@ -4907,6 +5042,9 @@ export default function App() {
       const { frames, duration } = framesResult;
       setVideoDuration(duration);
       if (controller.signal.aborted) return;
+      // Duration cap — checked now (before the costly API calls), aborts with a clean message.
+      const durBlock = capBlock({ user, durationSec: duration, mode: cfg, phase: "duration" });
+      if (durBlock) { usageEnd(); setScanDeadline(null); setAnalysisError(durBlock); return; }
 
       // Audio-level QC needs the transcript (for the voice/music split). Kick it
       // off now and let it run alongside the frame analysis; await before finalize.
@@ -5302,6 +5440,9 @@ export default function App() {
             onClearFeedback={clearFeedbackLog}
             usage={usageLedger}
             onClearUsage={clearUsageLog}
+            onSoftDelete={adminSoftDelete}
+            onRestore={adminRestoreScan}
+            onHardDelete={adminHardDelete}
           />
         )}
       </div>
