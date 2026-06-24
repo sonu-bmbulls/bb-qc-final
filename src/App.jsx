@@ -208,9 +208,14 @@ function issueTier(it) {
   if (it.priority === "ignore") return "style";
   // 2) MISTAKE — a confirmed trading-term error always counts
   if (matchTradingTerm(it.captionText, `${it.msg || ""} ${it.fix || ""}`)) return "mistake";
+  // 2b) MISTAKE — the frame-verification pass CONFIRMED this typo is real and
+  //     stably visible (verified=true). It is no longer "uncertain", so it must
+  //     NOT be held in Needs Review by the OCR-suspect rule below.
+  if (it.verified && it.confidence !== "low") return "mistake";
   // 3) REVIEW — anything uncertain. Audio mismatches are CONTEXT-only now: the
   //    voiceover never forces a "mistake" — at most it flags a word to review.
-  if (isOcrSuspect(it)) return "review";
+  //    An OCR doubled-letter suspect only stays in review until it's verified.
+  if (isOcrSuspect(it) && !it.verified) return "review";
   if (it.kind === "audio_mismatch") return "review";
   if (it.confidence === "low" || it.confidence === "medium") return "review";
   // 4) honor an explicit model tier of review/style if it set one
@@ -2575,7 +2580,11 @@ async function verifyAnimationSuspects(issues, plan, signal, onProgress = () => 
       out.push({ ...it, forcedTier: "review", confidence: "low", why: `${it.why ? it.why + " " : ""}(Checked against nearby frames — the stable on-screen text may already be correct; please verify.)` });
       continue;
     }
-    out.push(v.msg ? { ...it, msg: v.msg, fix: v.fix || it.fix } : it);
+    // CONFIRMED real & stably visible. Mark spelling/OCR suspects as verified so
+    // issueTier promotes them to Actual Mistake instead of leaving them in Review.
+    const confirmed = v.msg ? { ...it, msg: v.msg, fix: v.fix || it.fix } : { ...it };
+    if (isOcrSuspect(it) || needsStableVerify(it)) confirmed.verified = true;
+    out.push(confirmed);
   }
   out.forEach((x, i) => { x.id = i + 1; });
   return out;
