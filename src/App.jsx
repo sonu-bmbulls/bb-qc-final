@@ -133,6 +133,46 @@ const ISSUE_PREROLL_SEC = 1;
 const PROMPT_TOKENS_PER_CALL = 2600; // approx tokens for the QC instruction text per call
 const OUTPUT_TOKENS_PER_CALL = 350;  // rough average findings output per call
 
+// ── Actual API usage tracking (admin cost dashboard) ──────────────────────────
+// Every Anthropic response carries a real usage block. We accumulate the ACTUAL
+// tokens used across a whole scan (all batches + creative + verification calls),
+// compute the real cost, and append it to a persistent localStorage ledger that
+// survives the 7-day scan purge — so admin spend totals are accurate, not estimated.
+const USAGE_KEY = "bbqc_usage";
+const USAGE_LIMIT = 5000;
+let _usageAcc = null;
+function usageBegin() { _usageAcc = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, calls: 0 }; }
+function recordUsage(u) {
+  if (!_usageAcc || !u) return;
+  _usageAcc.in += u.input_tokens || 0;
+  _usageAcc.out += u.output_tokens || 0;
+  _usageAcc.cacheRead += u.cache_read_input_tokens || 0;
+  _usageAcc.cacheCreate += u.cache_creation_input_tokens || 0;
+  _usageAcc.calls += 1;
+}
+function usageEnd() { const a = _usageAcc; _usageAcc = null; return a; }
+// Real cost from token counts — cache reads bill ~0.1× input, writes ~1.25× input.
+function usageCost(u, mode) {
+  if (!u || !mode) return 0;
+  return (u.in / 1e6) * mode.priceIn
+    + (u.cacheRead / 1e6) * mode.priceIn * 0.1
+    + (u.cacheCreate / 1e6) * mode.priceIn * 1.25
+    + (u.out / 1e6) * mode.priceOut;
+}
+function loadUsageLedger() {
+  try { const a = JSON.parse(localStorage.getItem(USAGE_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+}
+function appendUsageLedger(entry) {
+  try {
+    const all = loadUsageLedger();
+    all.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, ts: Date.now(), ...entry });
+    localStorage.setItem(USAGE_KEY, JSON.stringify(all.slice(-USAGE_LIMIT)));
+  } catch { /* ignore quota */ }
+  return loadUsageLedger();
+}
+function clearUsageLedger() { try { localStorage.removeItem(USAGE_KEY); } catch { /* ignore */ } }
+
 const CHECKS = [
   { id: "grammar",  label: "Grammar & Spelling",   icon: "✍️", desc: "Captions, titles, on-screen text" },
   { id: "safezone", label: "Safe Zone Compliance", icon: "📐", desc: "Text & logos within safe zones" },
@@ -1843,6 +1883,7 @@ Now read EVERY [FRAME_METADATA] block in the user message, copy each timestamp v
   console.log(text);
   console.log("Usage:", data?.usage);
   console.groupEnd();
+  recordUsage(data?.usage);   // accumulate actual token usage for the cost ledger
 
   const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
   let parsed;
@@ -2536,6 +2577,7 @@ Return ONLY this JSON, nothing else:
     const res = await postMessages({ model, max_tokens: 400, temperature: 0, messages: [{ role: "user", content }] }, signal);
     if (!res.ok) return { real: true };
     const data = await res.json();
+    recordUsage(data?.usage);   // verification calls count toward the cost ledger too
     const text = (data?.content?.map((b) => b.text || "").join("") || "").trim();
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return { real: true };
@@ -4213,6 +4255,93 @@ function AdminFilterChip({ label, count, active, onClick, color }) {
   );
 }
 
+// Admin-only API usage / cost dashboard — aggregates the ACTUAL token-usage ledger
+// (recorded per scan from real Anthropic responses). Same-device, from when
+// tracking was enabled; the authoritative org total lives in the Anthropic Console.
+function UsageDashboard({ ledger, onClear }) {
+  const rows = ledger || [];
+  const sum = (f) => rows.reduce((a, r) => a + (f(r) || 0), 0);
+  const totalCost = sum((r) => r.costUsd);
+  const totalDur = sum((r) => r.durationSec);
+  const totalIn = sum((r) => (r.usage?.in || 0) + (r.usage?.cacheRead || 0) + (r.usage?.cacheCreate || 0));
+  const totalOut = sum((r) => r.usage?.out || 0);
+  const perMin = totalDur > 0 ? totalCost / (totalDur / 60) : 0;
+  const group = (key) => {
+    const m = new Map();
+    for (const r of rows) { const k = key(r) || "—"; const g = m.get(k) || { count: 0, cost: 0, dur: 0 }; g.count++; g.cost += r.costUsd || 0; g.dur += r.durationSec || 0; m.set(k, g); }
+    return [...m.entries()].sort((a, b) => b[1].cost - a[1].cost);
+  };
+  const byMode = group((r) => (MODES[r.modeId]?.label || r.modeId || "—"));
+  const byUser = group((r) => r.user || "—");
+  const byDay = group((r) => fmtDate(r.ts));
+  const BUDGET = 20;
+  const pctUsed = Math.min(100, (totalCost / BUDGET) * 100);
+  const avgPerScan = rows.length ? totalCost / rows.length : 0;
+  const scansLeft = avgPerScan > 0 ? Math.max(0, Math.floor((BUDGET - totalCost) / avgPerScan)) : null;
+  const cell = { padding: "9px 12px", borderBottom: `1px solid ${T.border}`, fontSize: 12.5 };
+  const card = (n, l, c) => (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${T.border}`, borderRadius: 10, padding: "12px 14px" }}>
+      <div style={{ fontSize: 19, fontWeight: 800, fontFamily: "DM Mono, monospace", color: c || "white" }}>{n}</div>
+      <div style={{ fontSize: 10.5, color: T.textDim, marginTop: 2 }}>{l}</div>
+    </div>
+  );
+  const miniTable = (title, data, fmtKey = (k) => k) => (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ fontSize: 10.5, color: T.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>{title}</div>
+      <div style={{ border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <tbody>
+            {data.length === 0 ? <tr><td style={{ ...cell, color: T.textDim }}>No data yet</td></tr> : data.map(([k, g], i) => (
+              <tr key={i}>
+                <td style={{ ...cell, fontWeight: 600 }}>{fmtKey(k)}</td>
+                <td style={{ ...cell, textAlign: "right", color: T.textMute, fontFamily: "DM Mono, monospace" }}>{g.count} scan{g.count !== 1 ? "s" : ""}</td>
+                <td style={{ ...cell, textAlign: "right", fontWeight: 800, fontFamily: "DM Mono, monospace", color: "#34d399" }}>${g.cost.toFixed(3)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+  return (
+    <div style={{ padding: 18 }}>
+      <p style={{ fontSize: 11.5, color: T.textDim, marginBottom: 14 }}>
+        Actual API cost recorded per scan (real tokens from each response), on this device, since usage tracking was enabled.
+        For your authoritative all-time total, see <strong style={{ color: "white" }}>console.anthropic.com → Usage</strong>.
+      </p>
+
+      {/* $20 budget bar */}
+      <div style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${T.border}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 6 }}>
+          <span style={{ color: T.textMute }}>Recorded spend</span>
+          <span style={{ fontFamily: "DM Mono, monospace", fontWeight: 800 }}><span style={{ color: "#34d399" }}>${totalCost.toFixed(2)}</span> <span style={{ color: T.textDim }}>/ ${BUDGET} credit</span></span>
+        </div>
+        <div style={{ height: 8, borderRadius: 6, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+          <div style={{ width: `${pctUsed}%`, height: "100%", background: pctUsed > 80 ? T.redBright : "#34d399" }} />
+        </div>
+        {scansLeft != null && <p style={{ fontSize: 10.5, color: T.textDim, marginTop: 6 }}>≈ {scansLeft} more scans left in ${BUDGET} at the current average of ${avgPerScan.toFixed(3)}/scan.</p>}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10 }}>
+        {card(rows.length, "Scans recorded")}
+        {card(fmtTs(totalDur), "Total duration")}
+        {card(`$${totalCost.toFixed(2)}`, "Total cost", "#34d399")}
+        {card(`$${perMin.toFixed(3)}`, "Cost / minute", "#34d399")}
+        {card(`${(totalIn / 1e6).toFixed(2)}M`, "Input tokens")}
+        {card(`${(totalOut / 1000).toFixed(0)}K`, "Output tokens")}
+      </div>
+
+      {miniTable("By scan mode", byMode)}
+      {miniTable("By user", byUser)}
+      {miniTable("By day", byDay)}
+
+      {rows.length > 0 && (
+        <button onClick={onClear} style={{ marginTop: 14, padding: "7px 13px", borderRadius: 8, cursor: "pointer", background: "rgba(255,255,255,0.04)", color: T.textDim, fontSize: 11, fontWeight: 700, border: `1px solid ${T.border}` }}>Clear usage ledger</button>
+      )}
+    </div>
+  );
+}
+
 // Admin-only internal cost calculator. All fields editable; auto-estimates with
 // the app's own estimateScanCost() formula. Not shown to normal users.
 function CostCalc() {
@@ -4292,7 +4421,7 @@ function CostCalc() {
   );
 }
 
-function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback }) {
+function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefresh, onClearFeedback, usage, onClearUsage }) {
   const [tab, setTab] = useState("overview");   // overview | videos | feedback
   const scans = allScans || [];
   const fb = feedback || [];
@@ -4341,10 +4470,15 @@ function AdminStage({ user, allScans, feedback, loading, onOpen, onBack, onRefre
         <AdminFilterChip label="👥 Users" count={users.length} active={tab === "overview"} onClick={() => setTab("overview")} color="#ef4444" />
         <AdminFilterChip label="🎬 Videos" count={scans.length} active={tab === "videos"} onClick={() => setTab("videos")} color="#ef4444" />
         <AdminFilterChip label="🧠 Feedback" count={fb.length} active={tab === "feedback"} onClick={() => setTab("feedback")} color="#ef4444" />
+        <AdminFilterChip label="📊 Usage" active={tab === "usage"} onClick={() => setTab("usage")} color="#ef4444" />
         <AdminFilterChip label="💰 Cost" active={tab === "cost"} onClick={() => setTab("cost")} color="#ef4444" />
       </div>
 
-      {tab === "cost" ? (
+      {tab === "usage" ? (
+        <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
+          <UsageDashboard ledger={usage} onClear={onClearUsage} />
+        </div>
+      ) : tab === "cost" ? (
         <div style={{ background: T.bgPanel, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden" }}>
           <CostCalc />
         </div>
@@ -4551,12 +4685,14 @@ export default function App() {
   const [showScanDone, setShowScanDone] = useState(false); // post-scan reminder modal
   const [musicRisk, setMusicRisk] = useState(null);        // pre-upload music copyright check
   const [audioLevels, setAudioLevels] = useState(null);    // audio loudness / peak / balance QC
+  const [usageLedger, setUsageLedger] = useState(loadUsageLedger); // ADMIN: actual API cost ledger
   const admin = isAdmin(user);
 
   const fileRef = useRef(null);
   const manualIdRef = useRef(-1);                          // ids for editor-added findings (negative → no clash)
   const musicRiskRef = useRef(null);                       // latest music-check result (for persistScan)
   const audioLevelsRef = useRef(null);                     // latest audio-levels result (for persistScan)
+  const scanMetaRef = useRef(null);                        // {modeId, usage, costUsd} of the latest run (for persistScan)
   const reviewCtxRef = useRef(null);                       // {scanId, owner, fileName} of the report being reviewed
   const wantPlayRef = useRef(false);                       // play from the pre-roll point after an issue click
   const videoRef = useRef(null);
@@ -4655,7 +4791,8 @@ export default function App() {
       sizeMb: +((f.size || 0) / 1048576).toFixed(1),
       durationSec: duration, createdAt: Date.now(),
       issues: issuesList, score, errors, warnings, info,
-      briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, audioLevels: audioLevelsRef.current, blob: f,
+      briefUsed: briefWasUsed, musicRisk: musicRiskRef.current, audioLevels: audioLevelsRef.current,
+      modeId: scanMetaRef.current?.modeId, usage: scanMetaRef.current?.usage, costUsd: scanMetaRef.current?.costUsd, blob: f,
     });
     refreshScans(user);
   }, [user, briefWasUsed, refreshScans]);
@@ -4696,10 +4833,13 @@ export default function App() {
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
     checkpointRef.current = null; currentScanIdRef.current = null;
     setFeedback(loadFeedback());
+    setUsageLedger(loadUsageLedger());
     setStage("admin");
     setDashLoading(true);
     try { setAllScans(await listAllScans()); } finally { setDashLoading(false); }
   }, []);
+
+  const clearUsageLog = useCallback(() => { clearUsageLedger(); setUsageLedger([]); }, []);
 
   // ── Admin: record a QC-feedback entry (the model-improvement signal).
   const recordFeedback = useCallback((entry) => {
@@ -4749,6 +4889,7 @@ export default function App() {
     setDoneIds(new Set());
     setMusicRisk(null); musicRiskRef.current = null;
     setAudioLevels(null); audioLevelsRef.current = null;
+    usageBegin();   // start counting actual API tokens for this scan
     setBriefWasUsed(briefForThisRun.length > 0);
 
     try {
@@ -4816,6 +4957,11 @@ export default function App() {
       setIssues(sortByTs(finalIssues));
       const audio = await audioPromise;                 // audio-level QC (started above)
       audioLevelsRef.current = audio; setAudioLevels(audio);
+      // Record ACTUAL token usage + cost for this scan → admin ledger.
+      const usage = usageEnd();
+      const costUsd = usageCost(usage, cfg);
+      scanMetaRef.current = { modeId: mode, usage, costUsd };
+      setUsageLedger(appendUsageLedger({ user, fileName: f.name || "video.mp4", durationSec: duration, modeId: mode, model: cfg.model, usage, costUsd }));
       finishRun(result);
       // Save (or update, on resume) this report to the user's workspace history.
       persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
@@ -4849,6 +4995,7 @@ export default function App() {
     const capMs = cfg.capFormula(plan.duration);
     setScanCapMs(capMs);
     setScanDeadline(Date.now() + capMs);
+    usageBegin();   // count the resume's additional API tokens
 
     try {
       const result = await analyzeSegments(plan, controller.signal, {
@@ -4862,6 +5009,11 @@ export default function App() {
       const finalIssues = await verifyAnimationSuspects(result.issues, plan, controller.signal, (p) => setAnalysisProgress(p));
       if (controller.signal.aborted) return;
       setIssues(sortByTs(finalIssues));
+      // The resume's extra token usage is logged as its own ledger entry.
+      const rUsage = usageEnd();
+      if (rUsage && rUsage.calls > 0) {
+        setUsageLedger(appendUsageLedger({ user, fileName: (plan.file?.name || "video.mp4") + " (resume)", durationSec: plan.duration, modeId: plan.modeId, model: cfg.model, usage: rUsage, costUsd: usageCost(rUsage, cfg) }));
+      }
       finishRun(result);
       // Save (or update, on resume) this report to the user's workspace history.
       persistScan(plan.file, plan.duration, finalIssues, currentScanIdRef.current);
@@ -5148,6 +5300,8 @@ export default function App() {
             onBack={goDashboard}
             onRefresh={openAdmin}
             onClearFeedback={clearFeedbackLog}
+            usage={usageLedger}
+            onClearUsage={clearUsageLog}
           />
         )}
       </div>
