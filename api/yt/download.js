@@ -154,7 +154,7 @@ export default async function handler(req, res) {
           p.on("close", () => { try { unlinkSync(tmp); } catch { /* */ } r(o.split("\n").filter((l) => /Duration|Stream/.test(l)).map((l) => l.trim())); });
         });
       }
-      res.status(200).json({ ok: code === 0, code, bytes, seconds: (Date.now() - t0) / 1000, name, formats: streams.map((f) => f.format_id), probe, err: code ? errTail.slice(-600) : undefined });
+      res.status(200).json({ ok: code === 0, code, bytes, seconds: (Date.now() - t0) / 1000, name, formats: streams.map((f) => f.format_id), availableIn: streams.map((f) => f.available_at ? Math.round((f.available_at * (f.available_at > 1e12 ? 1 : 1000) - t0) / 100) / 10 : null), probe, err: code ? errTail.slice(-600) : undefined });
     });
     res.on("close", () => { if (!res.writableEnded) killAll(); });
     return;
