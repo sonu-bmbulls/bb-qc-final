@@ -10,6 +10,7 @@
 import { spawn } from "node:child_process";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { startRelay } from "./_relay.js";
 import {
   bins, getInfo, commonArgs, readParams, validUrl, parseTime, videoChoices, bestAudio,
   friendlyError, safeFileName, fmtStamp, SPAWN_ENV_EXPORT as SPAWN_ENV,
@@ -91,9 +92,17 @@ export default async function handler(req, res) {
   const procs = [];
   const killAll = () => { for (const p of procs) { try { p.kill("SIGKILL"); } catch { /* dead */ } } cleanup(); };
 
+  // Full downloads: yt-dlp pipes its (chunked) download into ffmpeg — fastest, proven path.
+  // Segments: ffmpeg must seek, so it reads through the local seekable relay instead.
+  const useRelay = clipStart > 0;
+  let relay = null;
+  if (useRelay) {
+    relay = await startRelay(streams);
+    procs.push({ kill: () => relay.close() });
+  }
   const inputs = [];
   streams.forEach((f, i) => {
-    inputs.push(...(clipStart ? ["-ss", String(clipStart)] : []), "-i", `pipe:${3 + i}`);
+    inputs.push(...(clipStart ? ["-ss", String(clipStart)] : []), "-i", useRelay ? relay.url(i) : `pipe:${3 + i}`);
   });
 
   const clipTag = isClip ? `_${fmtStamp(clipStart)}-${clipEnd != null ? fmtStamp(clipEnd) : "end"}` : "";
@@ -103,7 +112,7 @@ export default async function handler(req, res) {
     ...inputs, ...maps,
     ...(clipDur ? ["-t", String(clipDur)] : []),
     ...outArgs, "pipe:1",
-  ], { env: SPAWN_ENV, stdio: ["ignore", "pipe", "pipe", ...streams.map(() => "pipe")] });
+  ], { env: SPAWN_ENV, stdio: ["ignore", "pipe", "pipe", ...(useRelay ? [] : streams.map(() => "pipe"))] });
   procs.push(ff);
 
   let errTail = "";
@@ -111,7 +120,7 @@ export default async function handler(req, res) {
   ff.stderr.on("data", note("ffmpeg"));
 
   // One yt-dlp per stream, writing into ffmpeg's extra pipes.
-  streams.forEach((f, i) => {
+  if (!useRelay) streams.forEach((f, i) => {
     const dl = spawn(ytdlp, [
       "--load-info-json", infoPath, "-f", String(f.format_id),
       "-o", "-", "--no-part", "--quiet", "--http-chunk-size", "10M",
