@@ -66,25 +66,30 @@ function run(cmd, args, timeoutMs) {
 }
 
 // Different YouTube clients get blocked at different times — try a few.
+// Blocks are intermittent, so the default set is tried again at the end.
 const CLIENT_ATTEMPTS = [
   [],
   ["--extractor-args", "youtube:player_client=tv,web_safari"],
   ["--extractor-args", "youtube:player_client=mweb,android_vr"],
+  ["--extractor-args", "youtube:player_client=tv_simply,web_embedded"],
+  [],
+];
+
+export const commonArgs = () => [
+  "--no-warnings", "--no-progress", "--no-cache-dir", "--socket-timeout", "15",
+  "--js-runtimes", `node:${process.execPath}`,
+  ...cookiesArgs(),
 ];
 
 export async function getInfo(url, budgetMs = 45000) {
   const { ytdlp } = bins();
-  const base = [
-    "-J", "--no-playlist", "--no-warnings", "--no-progress", "--no-cache-dir",
-    "--socket-timeout", "15",
-    "--js-runtimes", `node:${process.execPath}`,
-    ...cookiesArgs(),
-  ];
+  const base = ["-J", "--no-playlist", ...commonArgs()];
   const deadline = Date.now() + budgetMs;
   let lastErr;
   for (const extra of CLIENT_ATTEMPTS) {
     const left = deadline - Date.now();
     if (left < 5000) break;
+    if (lastErr) await new Promise((r) => setTimeout(r, 700));
     try {
       const json = await run(ytdlp, [...base, ...extra, "--", url], Math.min(left, 30000));
       return JSON.parse(json);
@@ -185,3 +190,5 @@ export function fmtStamp(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
   return (h ? `${h}h` : "") + `${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`;
 }
+
+export const SPAWN_ENV_EXPORT = SPAWN_ENV;

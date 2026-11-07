@@ -1,20 +1,24 @@
 // GET /api/yt/download?url=<link>&type=video|mp3&res=<1080|2160…>&kbps=<128|192|320>&start=<1:30>&end=<2:10>&ui=1
 //
-// yt-dlp resolves the stream URLs, then ffmpeg pulls them straight from YouTube
-// and streams the result to the browser — no temp files, so 4K works within the
-// function's memory/disk limits:
-//   video → best video at that resolution + best audio, remuxed (no re-encode) to fragmented MP4
-//   mp3   → best audio, encoded to MP3 at the chosen bitrate
-//   start/end (optional) → only that part of the video (video cuts land on the nearest keyframe)
+// 1. yt-dlp extracts the video once (-J) → info saved to /tmp
+// 2. yt-dlp downloads the chosen stream(s) from that info (--load-info-json,
+//    chunked requests YouTube accepts) straight to a pipe
+// 3. ffmpeg reads the pipe(s) and streams the result to the browser — no temp media files:
+//      video → best video at that resolution + best audio, remuxed (no re-encode) to fragmented MP4
+//      mp3   → best audio encoded to MP3 at the chosen bitrate
+//      start/end (optional) → only that part (video cuts land on the nearest keyframe)
 import { spawn } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import {
-  bins, getInfo, readParams, validUrl, parseTime, videoChoices, bestAudio, headersArg,
-  friendlyError, safeFileName, fmtStamp,
+  bins, getInfo, commonArgs, readParams, validUrl, parseTime, videoChoices, bestAudio,
+  friendlyError, safeFileName, fmtStamp, SPAWN_ENV_EXPORT as SPAWN_ENV,
 } from "./_shared.js";
 
 export const config = { runtime: "nodejs", maxDuration: 300 };
 
 function fail(res, wantHtml, status, msg) {
+  if (res.headersSent) return res.destroy();
   if (wantHtml) {
     res.statusCode = status;
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -51,24 +55,14 @@ export default async function handler(req, res) {
   const clipDur = clipEnd != null ? clipEnd - clipStart : null;
   const isClip = start != null || end != null;
 
+  // Pick the streams.
   const audio = bestAudio(info);
-  const inputs = [];
-  const maps = [];
-  let outArgs, ext, mime, suffix;
-
-  const addInput = (f) => {
-    inputs.push(
-      "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5",
-      ...headersArg(f),
-      ...(clipStart ? ["-ss", String(clipStart)] : []),
-      "-i", f.url,
-    );
-  };
-
+  const streams = [];          // formats to pull, in ffmpeg input order (pipe:3, pipe:4)
+  let maps, outArgs, ext, mime, suffix;
   if (type === "mp3") {
     if (!audio) return fail(res, ui, 404, "This video has no audio track.");
-    addInput(audio);
-    maps.push("-map", "0:a:0");
+    streams.push(audio);
+    maps = ["-map", "0:a:0"];
     outArgs = ["-vn", "-c:a", "libmp3lame", "-b:a", `${kbps}k`, "-metadata", `title=${info.title || ""}`, "-metadata", `artist=${info.uploader || ""}`, "-f", "mp3"];
     ext = "mp3"; mime = "audio/mpeg"; suffix = "";
   } else {
@@ -77,34 +71,61 @@ export default async function handler(req, res) {
     const want = Number(q.res) || choices[0].res;
     const choice = choices.find((c) => c.res === want) || choices.find((c) => c.res < want) || choices[choices.length - 1];
     const v = choice._f;
-    addInput(v);
-    const muxed = v.acodec && v.acodec !== "none";
-    if (muxed || !audio) {
-      maps.push("-map", "0:v:0", "-map", "0:a:0?");
+    streams.push(v);
+    if ((v.acodec && v.acodec !== "none") || !audio) {
+      maps = ["-map", "0:v:0", "-map", "0:a:0?"];
     } else {
-      addInput(audio);
-      maps.push("-map", "0:v:0", "-map", "1:a:0");
+      streams.push(audio);
+      maps = ["-map", "0:v:0", "-map", "1:a:0"];
     }
     outArgs = ["-c", "copy", "-movflags", "frag_keyframe+empty_moov+default_base_moof+delay_moov", "-f", "mp4"];
     ext = "mp4"; mime = "video/mp4"; suffix = `_${choice.label}`;
   }
 
+  // Save the extracted info so the download step doesn't hit YouTube's page again.
+  const infoPath = `/tmp/yt-${randomBytes(6).toString("hex")}.info.json`;
+  writeFileSync(infoPath, JSON.stringify(info));
+  const cleanup = () => { try { unlinkSync(infoPath); } catch { /* gone */ } };
+
+  const { ytdlp, ffmpeg } = bins();
+  const procs = [];
+  const killAll = () => { for (const p of procs) { try { p.kill("SIGKILL"); } catch { /* dead */ } } cleanup(); };
+
+  const inputs = [];
+  streams.forEach((f, i) => {
+    inputs.push(...(clipStart ? ["-ss", String(clipStart)] : []), "-i", `pipe:${3 + i}`);
+  });
+
   const clipTag = isClip ? `_${fmtStamp(clipStart)}-${clipEnd != null ? fmtStamp(clipEnd) : "end"}` : "";
   const name = `${safeFileName(info.title)}${suffix}${clipTag}.${ext}`;
-  const args = [
+  const ff = spawn(ffmpeg, [
     "-hide_banner", "-nostdin", "-loglevel", "error",
-    ...inputs,
-    ...maps,
+    ...inputs, ...maps,
     ...(clipDur ? ["-t", String(clipDur)] : []),
-    ...outArgs,
-    "pipe:1",
-  ];
+    ...outArgs, "pipe:1",
+  ], { env: SPAWN_ENV, stdio: ["ignore", "pipe", "pipe", ...streams.map(() => "pipe")] });
+  procs.push(ff);
 
-  const ff = spawn(bins().ffmpeg, args, { env: { ...process.env, HOME: "/tmp" } });
-  let started = false;
   let errTail = "";
-  ff.stderr.on("data", (d) => { errTail = (errTail + d).slice(-2000); });
+  const note = (who) => (d) => { errTail = (errTail + `[${who}] ` + d).slice(-2500); };
+  ff.stderr.on("data", note("ffmpeg"));
 
+  // One yt-dlp per stream, writing into ffmpeg's extra pipes.
+  streams.forEach((f, i) => {
+    const dl = spawn(ytdlp, [
+      "--load-info-json", infoPath, "-f", String(f.format_id),
+      "-o", "-", "--no-part", "--quiet", "--http-chunk-size", "10M",
+      ...commonArgs(),
+    ], { env: SPAWN_ENV, stdio: ["ignore", "pipe", "pipe"] });
+    procs.push(dl);
+    dl.stderr.on("data", note("yt-dlp"));
+    const sink = ff.stdio[3 + i];
+    sink.on("error", () => { /* ffmpeg stopped reading (e.g. clip end reached) */ });
+    dl.stdout.pipe(sink);
+    dl.on("close", (code) => { if (code && code !== 0 && code !== null) console.error("[yt/download] yt-dlp exit", code); });
+  });
+
+  let started = false;
   ff.stdout.once("data", (first) => {
     started = true;
     res.statusCode = 200;
@@ -118,11 +139,17 @@ export default async function handler(req, res) {
 
   ff.on("error", (e) => {
     console.error("[yt/download] spawn", e?.message);
+    killAll();
     if (!started) fail(res, ui, 500, friendlyError(e)); else res.destroy(e);
   });
   ff.on("close", (code) => {
+    // ffmpeg is done (or hit the clip end) — stop any downloads still running.
+    killAll();
     if (code !== 0) console.error("[yt/download] ffmpeg exit", code, errTail);
-    if (!started) fail(res, ui, 502, code === 0 ? "Nothing to download." : `Download failed: ${errTail.trim().split("\n").pop() || "ffmpeg error"}`);
+    if (!started) {
+      const line = errTail.trim().split("\n").filter(Boolean).pop() || "";
+      fail(res, ui, 502, code === 0 ? "Nothing to download." : /403|forbidden/i.test(errTail) ? "YouTube refused the download this time. Please try again." : `Download failed: ${line.slice(0, 200) || "ffmpeg error"}`);
+    }
   });
-  res.on("close", () => { if (!res.writableEnded) ff.kill("SIGKILL"); });
+  res.on("close", () => { if (!res.writableEnded) killAll(); });
 }
