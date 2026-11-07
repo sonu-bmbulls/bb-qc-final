@@ -126,6 +126,17 @@ export default async function handler(req, res) {
   });
 
   let started = false;
+  // Diagnostics: ?dryrun=1 runs the whole pipeline but only reports bytes/time.
+  if (q.dryrun === "1") {
+    const t0 = Date.now();
+    let bytes = 0;
+    ff.stdout.on("data", (d) => { bytes += d.length; });
+    ff.on("close", (code) => {
+      res.status(200).json({ ok: code === 0, code, bytes, seconds: (Date.now() - t0) / 1000, name, formats: streams.map((f) => f.format_id), err: code ? errTail.slice(-400) : undefined });
+    });
+    res.on("close", () => { if (!res.writableEnded) killAll(); });
+    return;
+  }
   ff.stdout.once("data", (first) => {
     started = true;
     res.statusCode = 200;
@@ -146,7 +157,7 @@ export default async function handler(req, res) {
     // ffmpeg is done (or hit the clip end) — stop any downloads still running.
     killAll();
     if (code !== 0) console.error("[yt/download] ffmpeg exit", code, errTail);
-    if (!started) {
+    if (!started && q.dryrun !== "1") {
       const line = errTail.trim().split("\n").filter(Boolean).pop() || "";
       fail(res, ui, 502, code === 0 ? "Nothing to download." : /403|forbidden/i.test(errTail) ? "YouTube refused the download this time. Please try again." : `Download failed: ${line.slice(0, 200) || "ffmpeg error"}`);
     }
