@@ -175,7 +175,7 @@ export default function YtDownloader({ onBack }) {
               </div>
               {!clip.ok && <p style={{ fontSize: 12, color: TT.amber, marginTop: 8 }}>⚠️ {clip.msg}</p>}
               <p style={{ fontSize: 11, color: TT.textDim, marginTop: 8 }}>
-                Leave start empty to begin at 0:00, or end empty to go to the end.{kind === "video" ? " Video cuts start at the nearest keyframe (within ~1–2 s)." : ""}
+                Leave start empty to begin at 0:00, or end empty to go to the end.{kind === "video" ? " Video plays from your start time; some editing apps may show a few extra seconds before it." : " MP3 cuts are exact."}
               </p>
             </div>
           )}
