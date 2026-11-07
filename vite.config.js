@@ -59,7 +59,7 @@ export default defineConfig(({ mode }) => {
     : '  ⚠ ELEVENLABS_API_KEY missing — audio cross-check will be skipped\n');
 
   return {
-    plugins: [react()],
+    plugins: [react(), devApiRoutes(['/api/yt/info', '/api/yt/download'])],
     server: {
       port: 5173,
       open: true,
@@ -199,3 +199,29 @@ export default defineConfig(({ mode }) => {
     },
   };
 });
+
+// ─── Dev-only: run Vercel-style api/*.js functions inside the Vite server ─────
+// In production Vercel serves these; locally this lets `npm run dev` use the
+// same handlers (YT Downloader) without needing `vercel dev`.
+function devApiRoutes(routes) {
+  return {
+    name: 'bb-dev-api-routes',
+    configureServer(server) {
+      for (const route of routes) {
+        server.middlewares.use(route, async (req, res) => {
+          try {
+            const mod = await server.ssrLoadModule(`${route}.js`);
+            const u = new URL(req.originalUrl || req.url, 'http://localhost');
+            req.query = Object.fromEntries(u.searchParams);
+            res.status = (code) => { res.statusCode = code; return res; };
+            res.json = (obj) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(obj)); return res; };
+            await mod.default(req, res);
+          } catch (e) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: String(e?.message || e) }));
+          }
+        });
+      }
+    },
+  };
+}

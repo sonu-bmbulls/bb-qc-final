@@ -25,6 +25,9 @@
 // ═════════════════════════════════════════════════════════════════════════════
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import ToolsHome from "./tools/ToolsHome.jsx";
+import YtDownloader from "./tools/YtDownloader.jsx";
+import Mp3Converter from "./tools/Mp3Converter.jsx";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. CONFIG + THEME
@@ -3197,13 +3200,13 @@ function IssueCard({ issue, isSelected, onClick, isDone, onToggleDone, onLearnCo
   );
 }
 
-function Nav({ apiStatus, user, onLogout, isAdminUser, onAdmin }) {
+function Nav({ apiStatus, user, onLogout, isAdminUser, onAdmin, onHome }) {
   const dotColor = !apiStatus.probed ? "#94a3b8" : apiStatus.ok ? "#10b981" : T.redBright;
   const dotLabel = !apiStatus.probed ? "Checking API…" : apiStatus.ok ? "API connected" : "API unavailable";
   return (
     <nav style={{ borderBottom: `1px solid ${T.border}`, background: "rgba(10,6,8,0.97)", backdropFilter: "blur(20px)", position: "sticky", top: 0, zIndex: 50 }}>
       <div style={{ maxWidth: 1480, margin: "0 auto", padding: "0 24px", height: 60, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <div onClick={user && onHome ? onHome : undefined} title={user ? "All tools" : undefined} style={{ display: "flex", alignItems: "center", gap: 12, cursor: user && onHome ? "pointer" : "default" }}>
           <div style={{ width: 36, height: 36, borderRadius: 9, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, letterSpacing: "-0.02em", boxShadow: "0 4px 12px rgba(220,38,38,0.3)" }}>BB</div>
           <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
             <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.01em" }}>BB QC Labs</span>
@@ -3215,6 +3218,9 @@ function Nav({ apiStatus, user, onLogout, isAdminUser, onAdmin }) {
             <div style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, boxShadow: `0 0 8px ${dotColor}` }} />
             <span style={{ fontSize: 12, color: T.textMute }}>{dotLabel}</span>
           </div>
+          {user && onHome && (
+            <button onClick={onHome} title="All tools" style={{ fontSize: 11, fontWeight: 800, color: T.textMute, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, borderRadius: 8, padding: "6px 12px", cursor: "pointer" }}>▦ Tools</button>
+          )}
           {user && isAdminUser && onAdmin && (
             <button onClick={onAdmin} title="Admin · QC monitor (all scans on this device)" style={{ fontSize: 11, fontWeight: 800, color: T.redLight, background: T.redTint, border: `1px solid ${T.borderHot}`, borderRadius: 8, padding: "6px 12px", cursor: "pointer" }}>🛡 Admin</button>
           )}
@@ -4170,7 +4176,7 @@ function LoginStage({ onLogin }) {
       <div style={{ width: "100%", maxWidth: 420, textAlign: "center" }}>
         <div style={{ width: 54, height: 54, borderRadius: 14, background: T.gradient, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, margin: "0 auto 20px", boxShadow: "0 6px 18px rgba(220,38,38,0.35)" }}>BB</div>
         <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.02em" }}>Welcome to BB QC Labs</h1>
-        <p style={{ color: T.textDim, marginTop: 10, fontSize: 14, lineHeight: 1.5 }}>Enter your name to open your QC workspace. Your scans are saved here for 7 days.</p>
+        <p style={{ color: T.textDim, marginTop: 10, fontSize: 14, lineHeight: 1.5 }}>Enter your name to open your BB tools workspace — QC Check, downloads, converters and more.</p>
         <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 12 }}>
           <input
             autoFocus value={name}
@@ -4221,12 +4227,13 @@ function ScanCard({ rec, onOpen }) {
   );
 }
 
-function DashboardStage({ user, scans, loading, onNewScan, onOpen, onDelete }) {
+function DashboardStage({ user, scans, loading, onNewScan, onOpen, onDelete, onHome }) {
   const recent = scans.slice(0, 6);
   return (
     <div className="fade-in" style={{ paddingTop: 8, paddingBottom: 48 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: 28 }}>
         <div>
+          {onHome && <button onClick={onHome} style={{ fontSize: 12, fontWeight: 700, color: T.textMute, background: "rgba(255,255,255,0.04)", border: `1px solid ${T.border}`, borderRadius: 10, padding: "8px 14px", cursor: "pointer", marginBottom: 14 }}>← All tools</button>}
           <h1 style={{ fontSize: 28, fontWeight: 800, letterSpacing: "-0.02em" }}>Your QC Workspace</h1>
           <p style={{ color: T.textDim, fontSize: 14, marginTop: 4 }}>Signed in as <strong style={{ color: "white" }}>{user}</strong> · reports saved to your workspace</p>
         </div>
@@ -4775,7 +4782,7 @@ function ScanDoneModal({ clean, mistakes, review, onClose }) {
 
 export default function App() {
   const [user, setUser] = useState(loadUser);   // "" until logged in
-  const [stage, setStage] = useState(() => (loadUser() ? "dashboard" : "login")); // login | dashboard | upload | confirm | analyzing | results
+  const [stage, setStage] = useState(() => (loadUser() ? "home" : "login")); // login | home | dashboard | upload | confirm | analyzing | results | yt | mp3
   const [scans, setScans] = useState([]);       // this user's saved reports (IndexedDB)
   const [dashLoading, setDashLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -4859,7 +4866,7 @@ export default function App() {
   useEffect(() => { if (user) refreshScans(user); /* load history on mount */ }, []); // eslint-disable-line
 
   const handleLogin = useCallback((name) => {
-    storeUser(name); setUser(name); setMemory(loadMemory(name)); setStage("dashboard"); refreshScans(name);
+    storeUser(name); setUser(name); setMemory(loadMemory(name)); setStage("home"); refreshScans(name);
   }, [refreshScans]);
 
   const handleLogout = useCallback(() => {
@@ -4880,6 +4887,22 @@ export default function App() {
     setStage("dashboard");
     if (user) refreshScans(user);
   }, [user, refreshScans]);
+
+  // ── Tools home (shown after login) ──────────────────────────────────────────
+  const goHome = useCallback(() => {
+    abortRef.current?.abort();
+    setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
+    setAnalysisError(null); setAnalysisWarning(null); setCanResume(false);
+    setScanDeadline(null); checkpointRef.current = null; currentScanIdRef.current = null;
+    setShowScanDone(false); setMusicRisk(null); musicRiskRef.current = null;
+    setAudioLevels(null); audioLevelsRef.current = null;
+    setStage(user ? "home" : "login");
+  }, [user]);
+
+  const openTool = useCallback((tool) => {
+    if (tool.stage === "dashboard") { goDashboard(); return; }
+    setStage(tool.stage);
+  }, [goDashboard]);
 
   const startNewScan = useCallback(() => {
     setFile(null); setIssues([]); setSelectedIssue(null); setCurrentTs(null);
@@ -5319,9 +5342,13 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, color: "white" }}>
-      <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} isAdminUser={admin} onAdmin={openAdmin} />
+      <Nav apiStatus={apiStatus} user={user} onLogout={handleLogout} isAdminUser={admin} onAdmin={openAdmin} onHome={goHome} />
       <div style={{ maxWidth: 1480, margin: "0 auto", padding: "24px" }}>
         {stage === "login" && <LoginStage onLogin={handleLogin} />}
+        {stage === "home" && <ToolsHome user={user} isAdmin={admin} onOpen={openTool} />}
+        {/* ── TOOL PAGES — one line per tool (see src/tools/registry.js) ── */}
+        {stage === "yt" && <YtDownloader onBack={goHome} />}
+        {stage === "mp3" && <Mp3Converter onBack={goHome} />}
         {stage === "dashboard" && (
           <DashboardStage
             user={user}
@@ -5330,6 +5357,7 @@ export default function App() {
             onNewScan={startNewScan}
             onOpen={openScan}
             onDelete={deleteScan}
+            onHome={goHome}
           />
         )}
         {stage === "results" && analysisWarning && (

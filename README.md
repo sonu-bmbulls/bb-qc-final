@@ -109,6 +109,20 @@ In `src/videoAnalysis.js`:
 - Brand names, foreign words, and technical terms can be misread as typos. This is a known limitation of OCR.
 - The prompt asks Claude to be conservative — but it's not perfect.
 
+## Tools home (after login)
+
+Every user now lands on a **tools home** after logging in:
+
+| Tool | Where it runs | Code |
+|---|---|---|
+| **QC Check** | existing QC workspace | `src/App.jsx` |
+| **YT Downloader** (beta) | Vercel functions `api/yt/info.js` + `api/yt/download.js` (`@distube/ytdl-core` v5, Node 24) | `src/tools/YtDownloader.jsx` |
+| **MP3 Converter** | 100% in the browser (Web Audio + `@breezystack/lamejs`) — files never leave the computer | `src/tools/Mp3Converter.jsx` |
+
+**Add a new tool:** build a component in `src/tools/`, add one entry to `src/tools/registry.js`, and render it for its stage in `App.jsx` (search for `TOOL PAGES`).
+
+YT Downloader notes: YouTube only serves single-file video+audio up to ~360p (higher qualities are video-only and would need an FFmpeg merge). Downloads stream through a 60 s function, so very long videos may cut off. YouTube can bot-block datacenter IPs — the UI shows a clear message when that happens.
+
 ## Files
 
 ```
