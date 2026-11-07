@@ -22,6 +22,7 @@ export function startRelay(formats) {
       total = Number(cr.split("/")[1]) || 0;
       try { await r.body?.cancel(); } catch { /* ignore */ }
       if (!total) throw new Error(`size lookup failed (HTTP ${r.status})`);
+      console.log("[yt/relay] size via range probe", i, total);
     }
     sizes.set(i, total);
     return total;
@@ -29,6 +30,7 @@ export function startRelay(formats) {
 
   const server = http.createServer(async (req, res) => {
     const i = Number(req.url.slice(1));
+    console.log("[yt/relay] req", req.method, req.url, req.headers.range || "(no range)");
     const f = formats[i];
     if (!f) { res.statusCode = 404; return res.end(); }
     const ac = new AbortController();
@@ -50,7 +52,10 @@ export function startRelay(formats) {
       for (let pos = start; pos <= end && !ac.signal.aborted;) {
         const to = Math.min(pos + CHUNK - 1, end);
         const r = await fetch(f.url, { headers: { ...(f.http_headers || {}), Range: `bytes=${pos}-${to}` }, signal: ac.signal });
-        if (r.status !== 206 && r.status !== 200) throw new Error(`YouTube HTTP ${r.status}`);
+        if (r.status !== 206 && r.status !== 200) {
+          const body = await r.text().catch(() => "");
+          throw new Error(`YouTube HTTP ${r.status} for bytes=${pos}-${to} ${body.slice(0, 120)}`);
+        }
         for await (const piece of r.body) {
           if (!res.write(piece)) await new Promise((ok) => res.once("drain", ok));
           pos += piece.length;
@@ -58,7 +63,7 @@ export function startRelay(formats) {
       }
       res.end();
     } catch (e) {
-      if (!ac.signal.aborted) console.error("[yt/relay]", e?.message);
+      console.error("[yt/relay]", ac.signal.aborted ? "(aborted)" : "", e?.message);
       res.destroy();
     }
   });
