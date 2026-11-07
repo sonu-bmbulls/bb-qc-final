@@ -3,6 +3,15 @@
   "functions": {
     "api/anthropic/v1/messages.js": {
       "maxDuration": 60
+    },
+    "api/yt/info.js": {
+      "maxDuration": 60,
+      "includeFiles": "bin/yt-dlp"
+    },
+    "api/yt/download.js": {
+      "maxDuration": 300,
+      "memory": 1024,
+      "includeFiles": "{bin/yt-dlp,node_modules/ffmpeg-static/ffmpeg}"
     }
   }
 }

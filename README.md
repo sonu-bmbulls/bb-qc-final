@@ -111,17 +111,25 @@ In `src/videoAnalysis.js`:
 
 ## Tools home (after login)
 
-Every user now lands on a **tools home** after logging in:
+Every user lands on a **tools home** after logging in:
 
 | Tool | Where it runs | Code |
 |---|---|---|
 | **QC Check** | existing QC workspace | `src/App.jsx` |
-| **YT Downloader** (beta) | Vercel functions `api/yt/info.js` + `api/yt/download.js` (`@distube/ytdl-core` v5, Node 24) | `src/tools/YtDownloader.jsx` |
-| **MP3 Converter** | 100% in the browser (Web Audio + `@breezystack/lamejs`) — files never leave the computer | `src/tools/Mp3Converter.jsx` |
+| **YT Downloader** (beta) | Vercel functions `api/yt/info.js` + `api/yt/download.js` using **yt-dlp + ffmpeg** | `src/tools/YtDownloader.jsx` |
+| **MP3 Converter** (bulk, up to 25 files) | 100% in the browser (Web Audio decode + lamejs in a Web Worker, ZIP via fflate) | `src/tools/Mp3Converter.jsx` |
 
 **Add a new tool:** build a component in `src/tools/`, add one entry to `src/tools/registry.js`, and render it for its stage in `App.jsx` (search for `TOOL PAGES`).
 
-YT Downloader notes: YouTube only serves single-file video+audio up to ~360p (higher qualities are video-only and would need an FFmpeg merge). Downloads stream through a 60 s function, so very long videos may cut off. YouTube can bot-block datacenter IPs — the UI shows a clear message when that happens.
+### YT Downloader internals
+- `npm run build` runs `scripts/fetch-ytdlp.mjs`, which downloads the latest standalone **yt-dlp** Linux binary into `bin/` (git-ignored). **ffmpeg** comes from the `ffmpeg-static` package. Both are bundled into the functions via `vercel.json` → `includeFiles`.
+- yt-dlp resolves the stream URLs (using Node as its JS runtime for YouTube's challenges); ffmpeg pulls them directly from YouTube and **streams** the result to the browser — no temp files:
+  - **Video** (any quality up to 4K): best video + best audio remuxed (no re-encode) into fragmented MP4.
+  - **MP3**: best audio encoded at 128/192/320 kbps.
+  - **Segment**: optional `start`/`end` — video cuts land on the nearest keyframe; MP3 cuts are exact.
+- Limits: the download function runs up to 300 s, so very large 4K files may stop early — use a lower quality or a segment.
+- If YouTube bot-checks the server, set a `YT_COOKIES` env var in Vercel (Netscape `cookies.txt` of a spare YouTube account, raw or base64).
+- Local dev: install `yt-dlp` on your PATH (or set `YTDLP_PATH`); `npm run dev` serves `/api/yt/*` through a Vite middleware.
 
 ## Files
 
