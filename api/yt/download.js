@@ -130,9 +130,22 @@ export default async function handler(req, res) {
   if (q.dryrun === "1") {
     const t0 = Date.now();
     let bytes = 0;
-    ff.stdout.on("data", (d) => { bytes += d.length; });
-    ff.on("close", (code) => {
-      res.status(200).json({ ok: code === 0, code, bytes, seconds: (Date.now() - t0) / 1000, name, formats: streams.map((f) => f.format_id), err: code ? errTail.slice(-400) : undefined });
+    const keep = q.probe === "1" && !(type === "video" && !isClip);
+    const chunks = [];
+    ff.stdout.on("data", (d) => { bytes += d.length; if (keep) chunks.push(d); });
+    ff.on("close", async (code) => {
+      let probe;
+      if (keep) {
+        // Report the real duration/streams of the produced file.
+        const tmp = `/tmp/probe-${randomBytes(4).toString("hex")}.${ext}`;
+        writeFileSync(tmp, Buffer.concat(chunks));
+        probe = await new Promise((r) => {
+          const p = spawn(ffmpeg, ["-hide_banner", "-i", tmp], { env: SPAWN_ENV });
+          let o = ""; p.stderr.on("data", (d) => { o += d; });
+          p.on("close", () => { try { unlinkSync(tmp); } catch { /* */ } r(o.split("\n").filter((l) => /Duration|Stream/.test(l)).map((l) => l.trim())); });
+        });
+      }
+      res.status(200).json({ ok: code === 0, code, bytes, seconds: (Date.now() - t0) / 1000, name, formats: streams.map((f) => f.format_id), probe, err: code ? errTail.slice(-600) : undefined });
     });
     res.on("close", () => { if (!res.writableEnded) killAll(); });
     return;
