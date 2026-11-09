@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { zipSync } from "fflate";
 import { TT, ToolHeader, btnPrimary, btnGhost, panel, fmtBytes, fmtDuration } from "./theme.jsx";
-import { decodeToAudioBuffer, encodeInWorker, cancelAllEncoding } from "./mp3Encode.js";
+import { decodeToAudioBuffer, encodeInWorker, cancelAllEncoding, PARALLEL } from "./mp3Encode.js";
 
 const MAX_FILES = 25;
 const BITRATES = [
@@ -28,6 +28,7 @@ export default function Mp3Converter({ onBack }) {
   const [running, setRunning] = useState(false);
   const [notice, setNotice] = useState("");
   const [dragOver, setDragOver] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef(null);
   const stopRef = useRef(false);
   const itemsRef = useRef(items);
@@ -61,26 +62,45 @@ export default function Mp3Converter({ onBack }) {
     setItems([]); setNotice("");
   };
 
+  // Converts PARALLEL files at a time. Big files (> 300 MB) take every slot so
+  // several decoded videos never sit in memory at once.
   const convertAll = async () => {
     setRunning(true); stopRef.current = false;
-    // Re-run anything not done yet (including previous failures).
-    const todo = itemsRef.current.filter((it) => it.status !== "done").map((it) => it.id);
-    for (const id of todo) {
-      if (stopRef.current) break;
+    const t0 = performance.now();
+    const queue = itemsRef.current.filter((it) => it.status !== "done").map((it) => it.id);
+    let inUse = 0;
+    const waiters = [];
+    const take = async (w) => {
+      while (inUse + w > PARALLEL) await new Promise((ok) => waiters.push(ok));
+      inUse += w;
+    };
+    const give = (w) => { inUse -= w; waiters.splice(0).forEach((ok) => ok()); };
+
+    const runOne = async (id) => {
       const it = itemsRef.current.find((x) => x.id === id);
-      if (!it) continue;
+      if (!it || stopRef.current) return;
+      const weight = it.file.size > 300 * 1024 * 1024 ? PARALLEL : 1;
+      await take(weight);
       try {
+        if (stopRef.current) return;
         patch(id, { status: "decoding", progress: 0, error: "" });
         const buf = await decodeToAudioBuffer(it.file);
-        if (stopRef.current) break;
+        if (stopRef.current) return;
         patch(id, { status: "encoding", progress: 0.02 });
         const blob = await encodeInWorker(buf, kbps, (v) => patch(id, { progress: v }));
         patch(id, { status: "done", progress: 1, url: URL.createObjectURL(blob), size: blob.size, duration: buf.duration, blob });
       } catch (e) {
-        if (e?.name === "AbortError") { patch(id, { status: "queued", progress: 0 }); break; }
-        patch(id, { status: "error", error: e?.message || "Conversion failed." });
+        if (e?.name === "AbortError") patch(id, { status: "queued", progress: 0 });
+        else patch(id, { status: "error", error: e?.message || "Conversion failed." });
+      } finally {
+        give(weight);
       }
-    }
+    };
+
+    let next = 0;
+    const lane = async () => { while (!stopRef.current && next < queue.length) await runOne(queue[next++]); };
+    await Promise.all(Array.from({ length: PARALLEL }, lane));
+    setElapsed((performance.now() - t0) / 1000);
     setRunning(false);
   };
 
@@ -170,7 +190,8 @@ export default function Mp3Converter({ onBack }) {
               <div style={{ height: "100%", width: `${Math.round(overall * 100)}%`, background: TT.gradient, transition: "width 0.3s" }} />
             </div>
             <p style={{ fontSize: 12, color: TT.textDim, marginTop: 6 }}>
-              {doneCount} of {items.length} done{failCount ? ` · ${failCount} failed` : ""}{running ? " · converting one at a time…" : ""}
+              {doneCount} of {items.length} done{failCount ? ` · ${failCount} failed` : ""}
+              {running ? ` · converting ${Math.min(PARALLEL, items.length - doneCount)} at a time…` : elapsed && doneCount ? ` · took ${elapsed.toFixed(1)} s` : ""}
             </p>
           </div>
         )}

@@ -59,6 +59,7 @@ export default defineConfig(({ mode }) => {
     : '  ⚠ ELEVENLABS_API_KEY missing — audio cross-check will be skipped\n');
 
   return {
+    worker: { format: 'es' },
     plugins: [react(), devApiRoutes(['/api/yt/info', '/api/yt/download'])],
     server: {
       port: 5173,

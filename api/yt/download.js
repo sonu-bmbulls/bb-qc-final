@@ -64,7 +64,7 @@ export default async function handler(req, res) {
     if (!audio) return fail(res, ui, 404, "This video has no audio track.");
     streams.push(audio);
     maps = ["-map", "0:a:0"];
-    outArgs = ["-vn", "-c:a", "libmp3lame", "-b:a", `${kbps}k`, "-metadata", `title=${info.title || ""}`, "-metadata", `artist=${info.uploader || ""}`, "-f", "mp3"];
+    outArgs = ["-vn", "-c:a", "libmp3lame", "-b:a", `${kbps}k`, "-compression_level", "7", "-metadata", `title=${info.title || ""}`, "-metadata", `artist=${info.uploader || ""}`, "-f", "mp3"];
     ext = "mp3"; mime = "audio/mpeg"; suffix = "";
   } else {
     const choices = videoChoices(info);
